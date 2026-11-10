@@ -17,6 +17,8 @@ namespace {
         NetworkSuggestion { u"Libera.Chat", Libera, 6697 },
         NetworkSuggestion { u"OFTC", Oftc, 6697 },
         NetworkSuggestion { u"hackint", Hackint, 6697 },
+        NetworkSuggestion { u"DALnet", u"irc.dal.net", 6697 },
+        NetworkSuggestion { u"Snoonet", u"irc.snoonet.org", 6697 },
     };
 
     constexpr std::array Channels {

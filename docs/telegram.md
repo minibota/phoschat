@@ -9,7 +9,7 @@ PhosChat uses the Telegram API through the official Telegram Database Library (T
 3. Leave **Remember this Telegram session** enabled to store its encryption key in the system keychain. Without a working keychain, use a temporary session and sign in again on the next launch.
 4. Open a discovered direct or group chat to request its recent text messages in an independent window. Basic groups and supergroups from both the main list and archive are included, without moving chats out of the archive. Discovery continues until Telegram reports that each list is complete. Unfinished discovery resumes after reconnecting.
 
-The published **v0.2.0** installers predate simplified sign-in and still require your API ID and hash. The source now supports bundled application credentials; the next configured official release will provide the simpler flow. See [release configuration](packaging.md#telegram-application-identity).
+Official **v0.2.1** builds include PhosChat's application credentials. The older **v0.2.0** installers require your own API ID and hash. See [release configuration](packaging.md#telegram-application-identity).
 
 ### Advanced and custom builds
 

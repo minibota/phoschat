@@ -54,6 +54,6 @@ jobs:
           cmake -S . -B build/bundled -G Ninja -DCMAKE_BUILD_TYPE=Debug
           -DPHOSCHAT_USE_KEYCHAIN=OFF -DPHOSCHAT_REQUIRE_TELEGRAM_APP_CREDENTIALS=ON
       - name: Build bundled sign-in tests
-        run: cmake --build build/bundled --target test_telegram_credentials test_ui test_core --parallel 2
+        run: cmake --build build/bundled --target test_telegram_credentials test_ui test_core test_account_overview test_irc_accounts --parallel 2
       - name: Test bundled sign-in without network accounts
-        run: ctest --test-dir build/bundled --output-on-failure -R '^phoschat[.](telegram_credentials|ui|core)$'
+        run: ctest --test-dir build/bundled --output-on-failure -R '^phoschat[.](telegram_credentials|ui|core|account_overview|irc_accounts)$'

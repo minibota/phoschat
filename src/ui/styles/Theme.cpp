@@ -241,6 +241,13 @@ namespace {
             border: none; border-radius: 0; background: transparent;
             padding: 0; min-width: 0; min-height: 0;
         }
+        QToolButton[role="accountHeader"] {
+            color: @muted@; border: 1px solid transparent; border-radius: 3px;
+            background: transparent; padding: 3px 4px; min-height: 17px; font-weight: 700;
+        }
+        QToolButton[role="accountHeader"]:hover { background: @row-hover@; }
+        QToolButton[role="accountHeader"]:checked { color: @text@; background: @panel@; }
+        QToolButton[role="accountHeader"]:focus { border-color: @focus@; }
         QToolButton[role="icon"] { padding: 3px; min-width: 23px; min-height: 23px; }
         QToolButton[role="icon"]::menu-indicator { image: none; width: 0; }
         QPushButton[role="primary"] {

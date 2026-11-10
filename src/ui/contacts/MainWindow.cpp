@@ -24,6 +24,7 @@
 #include <QLineEdit>
 #include <QMenu>
 #include <QPushButton>
+#include <QScrollArea>
 #include <QScrollBar>
 #include <QSettings>
 #include <QShortcut>
@@ -44,6 +45,7 @@ namespace {
     constexpr auto kMainGeometry = "windows/mainGeometry";
     constexpr auto kGrouping = "ui/grouping";
     constexpr auto kCollapsed = "ui/collapsedSections";
+    constexpr auto kOpenAccountSection = "ui/openAccountSection";
     constexpr auto kCloseToTray = "windows/closeToTray";
     constexpr auto kMinimizeToTray = "windows/minimizeToTray";
     constexpr auto kRestoreChats = "windows/restoreChats";
@@ -94,6 +96,8 @@ MainWindow::MainWindow(
     if (grouping >= 0 && grouping <= static_cast<int>(Grouping::Recent)) {
         m_grouping = static_cast<Grouping>(grouping);
     }
+    m_accountSectionInitialized = settings.contains(QLatin1String(kOpenAccountSection));
+    m_openAccountSection = settings.value(QLatin1String(kOpenAccountSection)).toString();
     for (const auto &key : settings.value(QLatin1String(kCollapsed)).toStringList()) {
         m_expanded.insert(key, false);
     }
@@ -168,7 +172,10 @@ MainWindow::MainWindow(
     auto *identity = new QVBoxLayout;
     identity->setSpacing(1);
     m_profileName = label({}, "profile");
+    m_profileName->setObjectName(QStringLiteral("accountSummaryTitle"));
     m_profileState = label({}, "muted");
+    m_profileState->setObjectName(QStringLiteral("accountSummaryState"));
+    m_profileState->setWordWrap(true);
     for (auto *field : { m_profileName, m_profileState }) {
         field->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
         identity->addWidget(field);
@@ -232,7 +239,18 @@ MainWindow::MainWindow(
     m_tree->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     m_tree->setSelectionMode(QAbstractItemView::SingleSelection);
     m_tree->setContextMenuPolicy(Qt::CustomContextMenu);
-    layout->addWidget(m_tree, 1);
+    m_conversationPanel = new QScrollArea;
+    m_conversationPanel->setObjectName(QStringLiteral("conversationAccordion"));
+    m_conversationPanel->setFrameShape(QFrame::NoFrame);
+    m_conversationPanel->setWidgetResizable(true);
+    m_conversationPanel->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    m_sectionContainer = new QWidget;
+    m_sectionLayout = new QVBoxLayout(m_sectionContainer);
+    m_sectionLayout->setContentsMargins(0, 0, 0, 0);
+    m_sectionLayout->setSpacing(3);
+    m_sectionLayout->addWidget(m_tree, 1);
+    m_conversationPanel->setWidget(m_sectionContainer);
+    layout->addWidget(m_conversationPanel, 1);
 
     m_empty = new QWidget;
     auto *emptyLayout = new QVBoxLayout(m_empty);
@@ -252,7 +270,13 @@ MainWindow::MainWindow(
     emptyLayout->addSpacing(4);
     emptyLayout->addWidget(m_emptyAction, 0, Qt::AlignHCenter);
     emptyLayout->addStretch();
-    layout->addWidget(m_empty, 1);
+    m_emptyView = new QScrollArea;
+    m_emptyView->setFrameShape(QFrame::NoFrame);
+    m_emptyView->setWidgetResizable(true);
+    m_emptyView->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    m_emptyView->setMinimumHeight(32);
+    m_emptyView->setWidget(m_empty);
+    m_sectionLayout->addWidget(m_emptyView, 1);
 
     layout->addWidget(rule());
     auto *status = new QHBoxLayout;
@@ -268,7 +292,7 @@ MainWindow::MainWindow(
     m_statusTimer->setSingleShot(true);
     connect(m_statusTimer, &QTimer::timeout, this, &MainWindow::refreshStatus);
     connect(m_search, &QLineEdit::textChanged, this, &MainWindow::reloadConversations);
-    connect(m_tree, &QTreeWidget::currentItemChanged, this, &MainWindow::refreshProfile);
+
     auto openItem = [this](QTreeWidgetItem *item) {
         if (const auto id = itemConversation(item)) {
             m_windows.open(*id);
@@ -300,8 +324,7 @@ MainWindow::MainWindow(
     connect(m_emptyAction, &QPushButton::clicked, this, [this] {
         if (!m_search->text().trimmed().isEmpty()) {
             m_search->clear();
-        } else if (std::ranges::any_of(m_accounts.accounts(),
-                       [](const Account &account) { return account.protocol == Protocol::Irc; })) {
+        } else if (m_emptyAction->property("discoverIrc").toBool()) {
             showIrcDirectory();
         } else {
             showAccounts();
@@ -326,6 +349,11 @@ MainWindow::MainWindow(
     connect(&m_accounts, &AccountManager::accountRemoved, this, [this](const QString &id) {
         const auto key = QStringLiteral("account/") + id;
         m_expanded.remove(key);
+        m_accountScroll.remove(key);
+        if (m_openAccountSection == key) {
+            m_openAccountSection.clear();
+            m_accountSectionInitialized = false;
+        }
         QSettings settings;
         auto collapsed = settings.value(QLatin1String(kCollapsed)).toStringList();
         if (collapsed.removeAll(key)) {
@@ -511,7 +539,10 @@ void MainWindow::showStartConversation(bool channel)
 void MainWindow::reloadConversations()
 {
     const auto selection = itemConversation(m_tree->currentItem());
+    saveAccountScroll();
     const auto filter = m_search->text().trimmed();
+    const bool filterChanged = filter != m_lastFilter;
+    const auto previousSearchSection = m_searchAccountSection;
     const int scrollPosition = m_lastFilter == filter ? m_tree->verticalScrollBar()->value() : 0;
     m_lastFilter = filter;
     const auto accounts = m_accounts.accounts();
@@ -534,8 +565,35 @@ void MainWindow::reloadConversations()
 
     const QSignalBlocker blocker(m_tree);
     const auto colors = QApplication::palette();
+    m_tree->setRootIndex({});
     m_tree->clear();
     QHash<QString, QTreeWidgetItem *> sections;
+    auto ensureSection = [&](const QString &key, const QString &title) {
+        auto *section = sections.value(key, nullptr);
+        if (!section) {
+            section = new QTreeWidgetItem(m_tree);
+            section->setFirstColumnSpanned(true);
+            section->setText(0, title);
+            section->setData(0, kSectionRole, key);
+            auto font = section->font(0);
+            font.setBold(true);
+            section->setFont(0, font);
+            section->setForeground(0, colors.brush(QPalette::PlaceholderText));
+            section->setFlags(section->flags() & ~Qt::ItemIsSelectable);
+            sections.insert(key, section);
+            if (key == QStringLiteral("favorites"))
+                m_tree->insertTopLevelItem(0, m_tree->takeTopLevelItem(m_tree->indexOfTopLevelItem(section)));
+        }
+        return section;
+    };
+    if (m_grouping == Grouping::Account) {
+        // An empty or offline account still has a reachable header.
+        for (const auto &account : accounts)
+            ensureSection(QStringLiteral("account/") + account.id,
+                accountLabel(account) == protocolLabel(account.protocol)
+                    ? accountLabel(account)
+                    : tr("%1 · %2").arg(accountLabel(account), protocolLabel(account.protocol)));
+    }
     for (const auto &conversation : conversations) {
         const auto &id = conversation.id;
         const auto account = accountsById.value(id.accountId);
@@ -582,19 +640,7 @@ void MainWindow::reloadConversations()
             }
         }
 
-        auto *section = sections.value(key, nullptr);
-        if (!section) {
-            section = new QTreeWidgetItem(m_tree);
-            section->setFirstColumnSpanned(true);
-            section->setText(0, sectionTitle);
-            section->setData(0, kSectionRole, key);
-            auto font = section->font(0);
-            font.setBold(true);
-            section->setFont(0, font);
-            section->setForeground(0, colors.brush(QPalette::PlaceholderText));
-            section->setFlags(section->flags() & ~Qt::ItemIsSelectable);
-            sections.insert(key, section);
-        }
+        auto *section = ensureSection(key, sectionTitle);
         auto *item = new QTreeWidgetItem(section);
         const bool channel = conversation.kind != ConversationKind::Direct;
         item->setText(0,
@@ -638,32 +684,15 @@ void MainWindow::reloadConversations()
         it.value()->setExpanded(!filter.isEmpty() || m_expanded.value(it.key(), true));
     }
     const bool empty = sections.isEmpty();
-    m_tree->setVisible(!empty);
-    m_empty->setVisible(empty);
-    if (!empty && scrollPosition > 0) {
+    rebuildAccountSections(filterChanged);
+    m_conversationPanel->show();
+    const bool keepSearchScroll = m_grouping == Grouping::Account && !filter.isEmpty() && !filterChanged
+        && previousSearchSection == m_searchAccountSection;
+    if ((m_grouping != Grouping::Account || keepSearchScroll) && !empty && scrollPosition > 0) {
         m_tree->doItemsLayout();
         m_tree->verticalScrollBar()->setValue(scrollPosition);
     }
-    if (empty) {
-        if (!filter.isEmpty()) {
-            m_emptyHeading->setText(tr("No matching conversations"));
-            m_emptyDescription->setText(tr("Search by conversation, network or group name."));
-            m_emptyAction->setText(tr("Clear search"));
-        } else if (accounts.isEmpty()) {
-            m_emptyHeading->setText(tr("Connect a messaging account"));
-            m_emptyDescription->setText(tr("Add an account to start browsing channels and conversations."));
-            m_emptyAction->setText(tr("Add account"));
-        } else if (std::ranges::any_of(
-                       accounts, [](const Account &account) { return account.protocol == Protocol::Irc; })) {
-            m_emptyHeading->setText(tr("No conversations yet"));
-            m_emptyDescription->setText(tr("Explore IRC channels, or use + to open a direct message."));
-            m_emptyAction->setText(tr("Discover channels"));
-        } else {
-            m_emptyHeading->setText(tr("No conversations yet"));
-            m_emptyDescription->setText(tr("Connect an account to load its conversations."));
-            m_emptyAction->setText(tr("Manage accounts"));
-        }
-    }
+    refreshEmptyState();
     refreshProfile();
     refreshStatus();
 }
@@ -671,32 +700,206 @@ void MainWindow::reloadConversations()
 void MainWindow::refreshProfile()
 {
     const auto accounts = m_accounts.accounts();
+    m_avatar->setText(QStringLiteral("P"));
     if (accounts.isEmpty()) {
-        m_avatar->setText(QStringLiteral("P"));
-        m_profileName->setText(tr("Local profile"));
+        m_profileName->setText(tr("Your accounts"));
         m_profileState->setText(tr("No account configured"));
         m_profileName->setToolTip({});
         m_profileState->setToolTip({});
         return;
     }
-    const auto selection = itemConversation(m_tree->currentItem());
-    auto selected
-        = selection ? std::ranges::find(accounts, selection->accountId, &Account::id) : accounts.end();
-    if (selected == accounts.end()) {
-        selected = std::ranges::find_if(accounts, [this](const Account &account) {
-            return m_accounts.state(account.id) == ConnectionState::Connected;
-        });
+    int online = 0;
+    int connecting = 0;
+    QStringList details;
+    for (const auto &account : accounts) {
+        const auto state = m_accounts.state(account.id);
+        if (state == ConnectionState::Connected)
+            ++online;
+        else if (state == ConnectionState::Connecting || state == ConnectionState::Authenticating
+            || state == ConnectionState::Reconnecting)
+            ++connecting;
+        details.append(tr("%1 · %2 · %3")
+                .arg(accountLabel(account), protocolLabel(account.protocol), connectionLabel(state)));
     }
-    const auto &account = selected == accounts.end() ? accounts.front() : *selected;
-    const auto name = accountLabel(account);
-    const auto state = connectionLabel(m_accounts.state(account.id));
-    const auto identity = account.nick.isEmpty() ? name : account.nick;
-    m_avatar->setText(identity.isEmpty() ? QStringLiteral("P") : identity.left(1).toUpper());
-    m_profileName->setText(identity);
-    m_profileName->setToolTip(identity.toHtmlEscaped());
-    m_profileState->setText(
-        tr("%1 · %2").arg(account.nick.isEmpty() ? protocolLabel(account.protocol) : name, state));
-    m_profileState->setToolTip(m_profileState->text().toHtmlEscaped());
+    const auto offline = accounts.size() - online - connecting;
+    m_profileName->setText(accounts.size() == 1 ? tr("1 account") : tr("%1 accounts").arg(accounts.size()));
+    auto summary = tr("%1 online · %2 offline").arg(online).arg(offline);
+    if (connecting > 0)
+        summary += tr(" · %1 connecting").arg(connecting);
+    m_profileState->setText(summary);
+    m_profileState->setAccessibleName(summary);
+    const auto tooltip = details.join(u'\n').toHtmlEscaped().replace(u'\n', QStringLiteral("<br>"));
+    m_profileName->setToolTip(tooltip);
+    m_profileState->setToolTip(tooltip);
+}
+
+void MainWindow::saveAccountScroll()
+{
+    if (m_grouping == Grouping::Account && m_lastFilter.isEmpty() && !m_openAccountSection.isEmpty()
+        && m_tree->rootIndex().isValid())
+        m_accountScroll[m_openAccountSection] = m_tree->verticalScrollBar()->value();
+}
+
+void MainWindow::rebuildAccountSections(bool filterChanged)
+{
+    QString focusedHeader;
+    for (const auto *header : std::as_const(m_accountHeaders)) {
+        if (header->hasFocus())
+            focusedHeader = header->property("sectionKey").toString();
+    }
+    // The headers live outside the scrolling conversation view. One shared tree
+    // keeps selection, activation and context-menu behavior identical in all modes.
+    while (auto *item = m_sectionLayout->takeAt(0)) {
+        if (auto *widget = item->widget(); widget && widget != m_tree && widget != m_emptyView)
+            delete widget;
+        delete item;
+    }
+    m_accountHeaders.clear();
+    if (m_grouping != Grouping::Account) {
+        m_tree->setRootIsDecorated(true);
+        m_tree->setMinimumHeight(0);
+        const bool empty = m_tree->topLevelItemCount() == 0;
+        m_tree->setVisible(!empty);
+        m_emptyView->setVisible(empty);
+        m_sectionLayout->addWidget(empty ? static_cast<QWidget *>(m_emptyView) : m_tree, 1);
+        return;
+    }
+
+    m_tree->setRootIsDecorated(false);
+    m_tree->setMinimumHeight(32);
+    const bool searching = !m_lastFilter.isEmpty();
+    QStringList keys;
+    QString firstWithChats;
+    for (int i = 0; i < m_tree->topLevelItemCount(); ++i) {
+        auto *section = m_tree->topLevelItem(i);
+        const auto key = section->data(0, kSectionRole).toString();
+        keys.append(key);
+        if (firstWithChats.isEmpty() && section->childCount() > 0)
+            firstWithChats = key;
+        auto *header = new QToolButton(m_sectionContainer);
+        header->setProperty("role", QStringLiteral("accountHeader"));
+        header->setProperty("sectionKey", key);
+        header->setObjectName(QStringLiteral("accountHeader/") + key);
+        header->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+        header->setFocusPolicy(Qt::StrongFocus);
+        header->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
+        header->setCheckable(true);
+        header->setText(tr("%1 (%2)").arg(section->text(0)).arg(section->childCount()));
+        header->setAccessibleName(header->text());
+        header->setToolTip(header->text().toHtmlEscaped());
+        header->setEnabled(!searching || section->childCount() > 0);
+        m_accountHeaders.append(header);
+        m_sectionLayout->addWidget(header);
+        connect(header, &QToolButton::clicked, this, [this, key] {
+            const auto current = m_lastFilter.isEmpty() ? m_openAccountSection : m_searchAccountSection;
+            activateAccountSection(current == key ? QString {} : key, true);
+        });
+        auto *expand = new QShortcut(QKeySequence(Qt::Key_Right), header);
+        expand->setContext(Qt::WidgetShortcut);
+        connect(expand, &QShortcut::activated, this, [this, key] { activateAccountSection(key, true); });
+        auto *collapse = new QShortcut(QKeySequence(Qt::Key_Left), header);
+        collapse->setContext(Qt::WidgetShortcut);
+        connect(collapse, &QShortcut::activated, this, [this] { activateAccountSection({}, true); });
+    }
+    if (!m_accountSectionInitialized && !keys.isEmpty()) {
+        m_openAccountSection = firstWithChats.isEmpty() ? keys.first() : firstWithChats;
+        m_accountSectionInitialized = true;
+    } else if (!m_openAccountSection.isEmpty() && !keys.contains(m_openAccountSection)) {
+        m_openAccountSection = firstWithChats.isEmpty() ? keys.value(0) : firstWithChats;
+    }
+    if (searching && (filterChanged || !keys.contains(m_searchAccountSection)))
+        m_searchAccountSection = firstWithChats;
+    activateAccountSection(searching ? m_searchAccountSection : m_openAccountSection, false);
+    for (auto *header : std::as_const(m_accountHeaders)) {
+        if (!focusedHeader.isEmpty() && header->property("sectionKey").toString() == focusedHeader)
+            header->setFocus();
+    }
+}
+
+void MainWindow::activateAccountSection(const QString &key, bool userAction)
+{
+    if (userAction)
+        saveAccountScroll();
+    const bool searching = !m_lastFilter.isEmpty();
+    if (searching)
+        m_searchAccountSection = key;
+    else {
+        m_openAccountSection = key;
+        if (userAction) {
+            m_accountSectionInitialized = true;
+            QSettings().setValue(QLatin1String(kOpenAccountSection), key);
+        }
+    }
+    m_sectionLayout->removeWidget(m_tree);
+    m_sectionLayout->removeWidget(m_emptyView);
+    // Remove the spacer used when all sections are collapsed.
+    for (int i = m_sectionLayout->count() - 1; i >= 0; --i) {
+        if (m_sectionLayout->itemAt(i)->spacerItem())
+            delete m_sectionLayout->takeAt(i);
+    }
+    QTreeWidgetItem *opened = nullptr;
+    for (int i = 0; i < m_accountHeaders.size(); ++i) {
+        auto *header = m_accountHeaders.at(i);
+        const bool active = header->property("sectionKey").toString() == key;
+        header->setChecked(active);
+        header->setArrowType(active ? Qt::DownArrow : Qt::RightArrow);
+        if (active) {
+            opened = m_tree->topLevelItem(i);
+            m_sectionLayout->insertWidget(m_sectionLayout->indexOf(header) + 1,
+                opened->childCount() > 0 ? static_cast<QWidget *>(m_tree) : m_emptyView, 1);
+        }
+    }
+    if (userAction) {
+        m_tree->clearSelection();
+        m_tree->setCurrentItem(nullptr);
+    }
+    const bool hasChats = opened && opened->childCount() > 0;
+    const bool noMatches = searching && std::ranges::none_of(m_accountHeaders, [](const QToolButton *header) {
+        return header->isEnabled();
+    });
+    const bool showEmpty = (opened && !hasChats) || noMatches || m_accountHeaders.isEmpty();
+    m_tree->setVisible(hasChats);
+    m_emptyView->setVisible(showEmpty);
+    m_tree->setRootIndex(opened ? m_tree->indexFromItem(opened) : QModelIndex {});
+    if (hasChats) {
+        m_tree->doItemsLayout();
+        m_tree->verticalScrollBar()->setValue(searching ? 0 : m_accountScroll.value(key));
+    } else if (!opened) {
+        if (showEmpty)
+            m_sectionLayout->addWidget(m_emptyView, 1);
+        else
+            m_sectionLayout->addStretch(1);
+    }
+    refreshEmptyState();
+}
+
+void MainWindow::refreshEmptyState()
+{
+    m_emptyAction->setProperty("discoverIrc", false);
+    const auto accounts = m_accounts.accounts();
+    if (!m_search->text().trimmed().isEmpty()) {
+        m_emptyHeading->setText(tr("No matching conversations"));
+        m_emptyDescription->setText(tr("Search by conversation, network or group name."));
+        m_emptyAction->setText(tr("Clear search"));
+    } else if (accounts.isEmpty()) {
+        m_emptyHeading->setText(tr("Connect a messaging account"));
+        m_emptyDescription->setText(tr("Add an account to start browsing channels and conversations."));
+        m_emptyAction->setText(tr("Add account"));
+    } else {
+        const auto activeId = m_openAccountSection.startsWith(QStringLiteral("account/"))
+            ? m_openAccountSection.mid(8)
+            : QString {};
+        const auto active = std::ranges::find(accounts, activeId, &Account::id);
+        const bool irc = active != accounts.end() ? active->protocol == Protocol::Irc
+                                                  : std::ranges::any_of(accounts, [](const Account &account) {
+                                                        return account.protocol == Protocol::Irc;
+                                                    });
+        m_emptyHeading->setText(tr("No conversations yet"));
+        m_emptyDescription->setText(irc ? tr("Explore IRC channels, or use + to open a direct message.")
+                                        : tr("Connect this account to load its conversations."));
+        m_emptyAction->setText(irc ? tr("Discover channels") : tr("Manage accounts"));
+        m_emptyAction->setProperty("discoverIrc", irc);
+    }
 }
 
 void MainWindow::refreshStatus()

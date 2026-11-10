@@ -1,10 +1,14 @@
 # Interface design
 
-PhosChat opens a 328 × 620 window with a search field and collapsible conversation groups. Dark and Light use slate and warm paper surfaces with the same phosphor identity. Appearance changes apply to all open windows and persist across restarts. The main window stays focused on the conversation list. Every conversation opens in its own native window.
+PhosChat opens a 328 × 620 window with a search field and an account accordion. Only one account list is open at a time; its conversations scroll independently of the other account headers. Dark and Light use slate and warm paper surfaces with the same phosphor identity. Appearance changes apply to all open windows and persist across restarts. The main window stays focused on the conversation list. Every conversation opens in its own native window.
 
 ## Everyday controls
 
-- Use **Accounts** to add an IRC server, set a nickname and connect. TLS starts enabled. An existing account retains its server, port and TLS settings. Add a separate account to change network identity.
+The top card summarizes every configured account, with online, offline and connecting totals. Its tooltip lists individual account states; selecting a conversation does not change this overview.
+
+The account headers stay outside the conversation list's scroll area. At very small window sizes or with more account headers than can physically fit, the header area also scrolls so every account remains reachable.
+
+- Use **Accounts** to choose a popular IRC network or **Custom server**, set a nickname and connect. TLS starts enabled. An existing account retains its server, port and TLS settings. Add a separate account to change network identity.
 - Use **+** to join a channel or open a direct message. Search matches conversation, network, protocol and custom group names.
 - Double-click a conversation, or activate it with the keyboard, to open or focus its chat window. Each window shows the account connection state. **People** opens the channel roster when applicable.
 - Use the conversation context menu to favorite, mute, group or leave a channel. The settings menu switches the list between account, protocol, custom group and recent activity. Favorites stay at the top.

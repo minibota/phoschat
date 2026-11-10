@@ -289,8 +289,8 @@ void TelegramCredentialsTest::bundledIdentityUsesIndependentSessionSecret()
     TelegramProvider provider(account, transport);
     provider.connectAccount(store.value);
     transport.auth(u"authorizationStateWaitTdlibParameters"_s);
-    QCOMPARE(transport.requests.last().value(u"api_id"_s).toInt(), bundledTelegramApiId());
-    QCOMPARE(transport.requests.last().value(u"api_hash"_s).toString().toLatin1(), bundledTelegramApiHash());
+    QVERIFY(transport.requests.last().value(u"api_id"_s).toInt() == bundledTelegramApiId());
+    QVERIFY(transport.requests.last().value(u"api_hash"_s).toString().toLatin1() == bundledTelegramApiHash());
     QCOMPARE(transport.key(), session->databaseKey);
 
     // A session-only official account reopened after a restart can sign in

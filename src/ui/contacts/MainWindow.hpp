@@ -11,6 +11,9 @@ class QLineEdit;
 class QMenu;
 class QPushButton;
 class QTimer;
+class QToolButton;
+class QScrollArea;
+class QVBoxLayout;
 class QTreeWidget;
 class QTreeWidgetItem;
 
@@ -50,6 +53,10 @@ private:
     void showStartConversation(bool channel);
     void reloadConversations();
     void refreshProfile();
+    void rebuildAccountSections(bool filterChanged);
+    void activateAccountSection(const QString &key, bool userAction);
+    void saveAccountScroll();
+    void refreshEmptyState();
     void refreshStatus();
     void refreshNetworks();
     void showConversationMenu(const QPoint &position);
@@ -61,7 +68,16 @@ private:
     WindowManager &m_windows;
     QLineEdit *m_search {};
     QTreeWidget *m_tree {};
+    QScrollArea *m_conversationPanel {};
+    QWidget *m_sectionContainer {};
+    QVBoxLayout *m_sectionLayout {};
+    QList<QToolButton *> m_accountHeaders;
+    QHash<QString, int> m_accountScroll;
+    QString m_openAccountSection;
+    QString m_searchAccountSection;
+    bool m_accountSectionInitialized {};
     QWidget *m_empty {};
+    QScrollArea *m_emptyView {};
     QLabel *m_emptyHeading {};
     QLabel *m_emptyDescription {};
     QPushButton *m_emptyAction {};

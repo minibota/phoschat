@@ -313,7 +313,7 @@ void IrcTest::boundsChannelDirectory()
 void IrcTest::searchesCuratedDirectory()
 {
     const auto networks = irc::recommendedNetworks();
-    QCOMPARE(networks.size(), 3);
+    QCOMPARE(networks.size(), 5);
     const auto suggestions = irc::recommendedChannels();
     const auto spanish = std::ranges::find(suggestions, QStringView(u"#pyar"), &irc::ChannelSuggestion::name);
     QVERIFY(spanish != suggestions.end());

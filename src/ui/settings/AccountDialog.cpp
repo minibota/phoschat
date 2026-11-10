@@ -1,6 +1,7 @@
 #include "ui/settings/AccountDialog.hpp"
 
 #include "core/account_manager.h"
+#include "providers/irc/irc_directory.h"
 #include "security/telegram_app_credentials.h"
 #include "ui/Presentation.hpp"
 
@@ -52,6 +53,7 @@ AccountDialog::AccountDialog(AccountManager &accounts, QWidget *parent)
         m_protocol->addItem(protocolLabel(protocol), static_cast<int>(protocol));
     selector->addRow(tr("&Protocol"), m_protocol);
     m_label = new QLineEdit;
+    m_label->setObjectName(QStringLiteral("accountName"));
     m_label->setPlaceholderText(tr("Optional display name"));
     m_label->setMaxLength(100);
     selector->addRow(tr("&Name"), m_label);
@@ -59,23 +61,40 @@ AccountDialog::AccountDialog(AccountManager &accounts, QWidget *parent)
 
     m_ircNetwork = new QGroupBox(tr("IRC network"));
     auto *form = new QFormLayout(m_ircNetwork);
+    m_ircPreset = new QComboBox;
+    m_ircPreset->setObjectName(QStringLiteral("ircNetworkPreset"));
+    for (const auto &network : irc::recommendedNetworks()) {
+        m_ircPreset->addItem(network.name.toString(), network.host.toString());
+        const int index = m_ircPreset->count() - 1;
+        m_ircPreset->setItemData(index, network.port, Qt::UserRole + 1);
+        m_ircPreset->setItemData(
+            index, tr("%1 · TLS on port %2").arg(network.host.toString()).arg(network.port), Qt::ToolTipRole);
+    }
+    m_ircPreset->addItem(tr("Custom server…"), QString {});
+    form->addRow(tr("&Network"), m_ircPreset);
     m_host = new QLineEdit;
+    m_host->setObjectName(QStringLiteral("ircServer"));
     m_host->setPlaceholderText(QStringLiteral("irc.libera.chat"));
     m_host->setMaxLength(255);
     form->addRow(tr("&Server"), m_host);
     const auto networkHint = tr("Add a new account to change the server, port or TLS mode.");
     m_host->setToolTip(networkHint);
     m_port = new QSpinBox;
+    m_port->setObjectName(QStringLiteral("ircPort"));
     m_port->setRange(1, 65535);
     m_tls = new QCheckBox(tr("Use TLS"));
+    m_tls->setObjectName(QStringLiteral("ircTls"));
     m_port->setToolTip(networkHint);
     m_tls->setToolTip(networkHint);
     auto *portRow = new QHBoxLayout;
     portRow->addWidget(m_port);
     portRow->addWidget(m_tls);
     portRow->addStretch(1);
-    form->addRow(tr("&Port"), portRow);
+    auto *portLabel = new QLabel(tr("&Port"));
+    portLabel->setBuddy(m_port);
+    form->addRow(portLabel, portRow);
     m_nick = new QLineEdit;
+    m_nick->setObjectName(QStringLiteral("ircNickname"));
     m_nick->setMaxLength(64);
     m_nick->setPlaceholderText(tr("Your IRC nickname"));
     form->addRow(tr("N&ickname"), m_nick);
@@ -167,6 +186,7 @@ AccountDialog::AccountDialog(AccountManager &accounts, QWidget *parent)
 
     connect(m_account, &QComboBox::currentIndexChanged, this, &AccountDialog::loadSelected);
     connect(m_protocol, &QComboBox::currentIndexChanged, this, &AccountDialog::refreshProtocolFields);
+    connect(m_ircPreset, &QComboBox::currentIndexChanged, this, &AccountDialog::applyIrcPreset);
     connect(m_customTelegramApplication, &QCheckBox::toggled, this, &AccountDialog::refreshProtocolFields);
     connect(m_tls, &QCheckBox::toggled, this, [this](bool tls) {
         if (m_port->value() == (tls ? 6667 : 6697)) {
@@ -204,6 +224,7 @@ void AccountDialog::prefillIrcNetwork(const QString &label, const QString &host,
     m_host->setText(host);
     m_tls->setChecked(true);
     m_port->setValue(port);
+    syncIrcPreset();
     m_nick->setFocus();
 }
 
@@ -229,10 +250,6 @@ void AccountDialog::loadSelected()
     const QSignalBlocker blocker(m_protocol);
     m_protocol->setCurrentIndex(m_protocol->findData(static_cast<int>(account.protocol)));
     m_protocol->setEnabled(isNew);
-    m_host->setEnabled(isNew);
-    m_port->setEnabled(isNew);
-    m_tls->setEnabled(isNew);
-    m_networkHint->setVisible(!isNew);
     m_label->setText(account.label);
     m_host->setText(account.host);
     m_tls->setChecked(account.tls);
@@ -252,10 +269,71 @@ void AccountDialog::loadSelected()
     m_autoConnect->setChecked(account.autoConnect);
     m_password->clear();
     m_cloudSecret->clear();
+    if (isNew) {
+        const QSignalBlocker presetBlocker(m_ircPreset);
+        m_ircPreset->setCurrentIndex(0);
+        applyIrcPreset();
+    } else {
+        syncIrcPreset();
+    }
     m_password->setPlaceholderText(
         account.saveSecret ? tr("Leave blank to keep the saved password") : QString {});
     m_feedback->hide();
     refreshProtocolFields();
+}
+
+void AccountDialog::applyIrcPreset()
+{
+    if (m_account->currentData().toString().isEmpty()) {
+        const auto host = m_ircPreset->currentData().toString();
+        if (!host.isEmpty()) {
+            if (m_host->text().compare(host, Qt::CaseInsensitive) != 0) {
+                m_saslUser->clear();
+                m_password->clear();
+            }
+            m_host->setText(host);
+            m_tls->setChecked(true);
+            m_port->setValue(m_ircPreset->currentData(Qt::UserRole + 1).toInt());
+        }
+    }
+    refreshIrcEndpointFields();
+}
+
+void AccountDialog::syncIrcPreset()
+{
+    int selected = m_ircPreset->count() - 1;
+    for (int index = 0; index < m_ircPreset->count() - 1; ++index) {
+        if (m_tls->isChecked()
+            && m_host->text().compare(m_ircPreset->itemData(index).toString(), Qt::CaseInsensitive) == 0
+            && m_port->value() == m_ircPreset->itemData(index, Qt::UserRole + 1).toInt()) {
+            selected = index;
+            break;
+        }
+    }
+    const QSignalBlocker blocker(m_ircPreset);
+    m_ircPreset->setCurrentIndex(selected);
+    refreshIrcEndpointFields();
+}
+
+void AccountDialog::refreshIrcEndpointFields()
+{
+    const bool existing = !m_account->currentData().toString().isEmpty();
+    const bool custom = m_ircPreset->currentData().toString().isEmpty();
+    m_ircPreset->setEnabled(!existing);
+    for (auto *field :
+        { static_cast<QWidget *>(m_host), static_cast<QWidget *>(m_port), static_cast<QWidget *>(m_tls) }) {
+        field->setEnabled(!existing && custom);
+        field->setToolTip(existing ? tr("Add a new account to change the server, port or TLS mode.")
+                : custom           ? QString {}
+                                   : tr("Choose Custom server to edit this endpoint."));
+    }
+    m_networkHint->setText(existing ? tr("Add a new account to change the server, port or TLS mode.")
+            : custom                ? tr("Enter the server address and port supplied by your IRC network.")
+                     : tr("The network's TLS settings are filled in. Choose a nickname to connect."));
+    m_label->setPlaceholderText(
+        static_cast<Protocol>(m_protocol->currentData().toInt()) == Protocol::Irc && !custom
+            ? m_ircPreset->currentText()
+            : tr("Optional display name"));
 }
 
 void AccountDialog::refreshProtocolFields()
@@ -273,6 +351,7 @@ void AccountDialog::refreshProtocolFields()
     }
     m_ircNetwork->setVisible(irc);
     m_ircAuthentication->setVisible(irc);
+    refreshIrcEndpointFields();
     m_cloudSettings->setVisible(!irc);
     m_cloudSettings->setTitle(telegram ? tr("Telegram sign-in") : tr("Provider setup"));
     m_customTelegramApplication->setVisible(telegram && bundled && !existing);
@@ -364,7 +443,9 @@ void AccountDialog::save(bool connectAfter)
     }
     account.label = m_label->text().trimmed();
     if (account.label.isEmpty()) {
-        account.label = protocol == Protocol::Irc ? host : protocolLabel(protocol);
+        account.label = protocol == Protocol::Irc
+            ? (m_ircPreset->currentData().toString().isEmpty() ? host : m_ircPreset->currentText())
+            : protocolLabel(protocol);
     }
     if (protocol == Protocol::Irc) {
         account.host = host;

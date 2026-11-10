@@ -7,10 +7,10 @@ with Secure Transport and signed macOS packaging remain future work.
 
 | Package | Install |
 | --- | --- |
-| Debian 13 | `sudo apt install ./phoschat_0.2.0_amd64.deb` |
-| Fedora 45 | `sudo dnf install --nogpgcheck ./phoschat-0.2.0-*.x86_64.rpm` |
-| Windows x64 | Run `phoschat-0.2.0-windows-x64-setup.exe` |
-| Flatpak | `flatpak install --user ./phoschat-0.2.0-x86_64.flatpak` |
+| Debian 13 | `sudo apt install ./phoschat_0.2.1_amd64.deb` |
+| Fedora 45 | `sudo dnf install --nogpgcheck ./phoschat-0.2.1-*.x86_64.rpm` |
+| Windows x64 | Run `phoschat-0.2.1-windows-x64-setup.exe` |
+| Flatpak | `flatpak install --user ./phoschat-0.2.1-x86_64.flatpak` |
 
 The RPM and Windows installer are unsigned. Check the downloads against
 `SHA256SUMS` on the release page before installing. Flatpak uses the KDE 6.10
@@ -47,7 +47,7 @@ flatpak install --user flathub org.kde.Platform//6.10 org.kde.Sdk//6.10
 flatpak-builder --user --force-clean --disable-rofiles-fuse --repo=repo build-flatpak \
   packaging/flatpak/io.phoschat.desktop.json
 flatpak build-bundle --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo \
-  repo phoschat-0.2.0-x86_64.flatpak io.phoschat.desktop
+  repo phoschat-0.2.1-x86_64.flatpak io.phoschat.desktop
 ```
 
 ## GitHub releases
@@ -65,7 +65,7 @@ The release workflow validates their presence before building packages. It maps 
 
 Application credentials embedded in a desktop executable can be extracted. They identify PhosChat to Telegram; they are not user authentication tokens or encryption keys. Every user still authorizes their own Telegram account, and local session keys come from the operating system's random generator. Pull-request CI never receives the real application secrets; its configured-build checks use synthetic values. Do not export Flatpak build sources or debug bundles from a directory containing the private inputs; distribute corresponding source from the clean repository tag.
 
-For a local configured build, set the two `PHOSCHAT_TELEGRAM_*` environment variables through your local secret tooling before configuring CMake. `-DPHOSCHAT_REQUIRE_TELEGRAM_APP_CREDENTIALS=ON` rejects missing values. Ordinary source builds can omit both variables and use the advanced per-account fields. The published v0.2.0 binaries retain the old manual setup until a new release is built with the repository secrets.
+For a local configured build, set the two `PHOSCHAT_TELEGRAM_*` environment variables through your local secret tooling before configuring CMake. `-DPHOSCHAT_REQUIRE_TELEGRAM_APP_CREDENTIALS=ON` rejects missing values. Ordinary source builds can omit both variables and use the advanced per-account fields. Official v0.2.1 packages use these secrets for the simplified Telegram sign-in flow. Older v0.2.0 binaries retain manual setup.
 
 ### Publishing
 

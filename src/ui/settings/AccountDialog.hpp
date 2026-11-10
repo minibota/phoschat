@@ -28,6 +28,9 @@ private:
     void refreshAccountList(const QString &selection);
     void loadSelected();
     void refreshProtocolFields();
+    void applyIrcPreset();
+    void syncIrcPreset();
+    void refreshIrcEndpointFields();
     void refreshStatus();
     void save(bool connectAfter);
     void removeSelected();
@@ -37,6 +40,7 @@ private:
     bool m_telegramDefaultsApplied {};
     QComboBox *m_account {};
     QComboBox *m_protocol {};
+    QComboBox *m_ircPreset {};
     QGroupBox *m_ircNetwork {};
     QGroupBox *m_ircAuthentication {};
     QGroupBox *m_cloudSettings {};
