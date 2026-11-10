@@ -1,0 +1,8 @@
+BasedOnStyle: WebKit
+IndentWidth: 4
+ColumnLimit: 110
+PointerAlignment: Right
+BreakBeforeBraces: Custom
+BraceWrapping:
+  AfterFunction: true
+SortIncludes: CaseSensitive

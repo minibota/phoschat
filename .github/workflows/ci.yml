@@ -1,0 +1,37 @@
+name: Build and test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            qt_arch: linux_gcc_64
+          - os: windows-2022
+            qt_arch: win64_msvc2022_64
+          - os: macos-14
+            qt_arch: clang_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.3'
+          arch: ${{ matrix.qt_arch }}
+          cache: true
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+      - run: cmake --preset debug -DPHOSCHAT_USE_KEYCHAIN=OFF
+      - run: cmake --build --preset debug --parallel 2
+      - run: ctest --preset debug
+      - run: cmake --preset release -DBUILD_TESTING=OFF -DPHOSCHAT_USE_KEYCHAIN=OFF
+      - run: cmake --build --preset release --parallel 2

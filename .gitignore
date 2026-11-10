@@ -1,0 +1,9 @@
+/build/
+/build-*/
+/.phoschat-toolchain/
+/.codex/
+/.cache/
+/artifacts/
+/CMakeUserPresets.json
+*.user
+__pycache__/

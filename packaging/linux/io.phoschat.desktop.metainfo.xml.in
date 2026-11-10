@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.phoschat.desktop</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <name>PhosChat</name>
+  <summary>A compact desktop client for IRC, Telegram and Slack</summary>
+  <description>
+    <p>PhosChat brings multiple messaging accounts together in a compact conversation list. Open each chat in its own window, organize favorites and keep message history on your computer.</p>
+    <p>IRC supports TLS, channel discovery and private messages. Telegram uses TDLib, and Slack connects to an approved workspace app with browser authorization or a user token. Choose between dark and light themes.</p>
+  </description>
+  <launchable type="desktop-id">io.phoschat.desktop.desktop</launchable>
+  <developer id="com.github.minibota">
+    <name>Minibota Labs</name>
+  </developer>
+  <url type="homepage">https://github.com/minibota/phoschat</url>
+  <url type="bugtracker">https://github.com/minibota/phoschat/issues</url>
+  <url type="vcs-browser">https://github.com/minibota/phoschat</url>
+  <categories>
+    <category>Network</category>
+    <category>Chat</category>
+  </categories>
+  <provides>
+    <binary>phoschat</binary>
+  </provides>
+  <content_rating type="oars-1.1">
+    <content_attribute id="social-chat">intense</content_attribute>
+  </content_rating>
+</component>

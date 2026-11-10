@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=PhosChat
+GenericName=Messaging Client
+GenericName[es]=Cliente de mensajería
+Comment=All your conversations. One place.
+Comment[es]=Todas tus conversaciones en un solo lugar.
+Exec=phoschat
+Icon=io.phoschat.desktop
+Terminal=false
+Categories=Network;Chat;
+Keywords=IRC;Telegram;Slack;messaging;

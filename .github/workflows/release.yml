@@ -1,0 +1,265 @@
+name: Package and release
+
+on:
+  push:
+    branches: [main]
+    paths: [packaging/release-version]
+    tags: ['v[0-9]*']
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish a prerelease for this version from main
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: phoschat-packaging-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  TDLIB_REF: c8828d50f5eac2fc7089ce1089d7ce9095c61b5e
+  QT_VERSION: '6.8.3'
+  QTKEYCHAIN_TAG: '0.17.0'
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      number: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify release version
+        id: check
+        env:
+          PUBLISH_MANUAL: ${{ inputs.publish }}
+        run: |
+          set -euo pipefail
+          version="$(tr -d '\r\n' < packaging/release-version)"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          cmake_version="$(sed -nE 's/^project\(PhosChat VERSION ([0-9]+\.[0-9]+\.[0-9]+) LANGUAGES CXX\)$/\1/p' CMakeLists.txt)"
+          [[ "$version" == "$cmake_version" ]]
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            [[ "$GITHUB_REF_NAME" == "v$version" ]]
+          fi
+          if [[ "$PUBLISH_MANUAL" == true && "$GITHUB_REF" != refs/heads/main ]]; then
+            echo "Manual publishing is allowed from main." >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  debian:
+    runs-on: ubuntu-24.04
+    needs: version
+    container: debian:trixie
+    steps:
+      - name: Install Debian build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential ca-certificates cmake \
+            desktop-file-utils dpkg-dev git ninja-build qt6-base-dev libqt6sql6-sqlite \
+            qtkeychain-qt6-dev
+      - uses: actions/checkout@v4
+      - name: Build, test and create DEB
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DPHOSCHAT_ENABLE_PACKAGING=ON
+          cmake --build build --parallel 2
+          ctest --test-dir build --output-on-failure
+          desktop-file-validate packaging/linux/io.phoschat.desktop.desktop
+          cpack --config build/CPackConfig.cmake -G DEB -B dist
+      - name: Install and smoke test DEB
+        run: |
+          apt-get install -y ./dist/phoschat_*.deb
+          test -f /usr/share/applications/io.phoschat.desktop.desktop
+          dpkg-query -W libtdjson1.8.38
+          QT_QPA_PLATFORM=offscreen phoschat --version | grep -F "PhosChat ${{ needs.version.outputs.number }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: phoschat-deb
+          path: dist/phoschat_*.deb
+          if-no-files-found: error
+
+  fedora:
+    runs-on: ubuntu-24.04
+    needs: version
+    container: fedora:45
+    timeout-minutes: 65
+    steps:
+      - name: Install Fedora build dependencies
+        run: |
+          dnf install -y git gcc-c++ cmake ninja-build rpm-build qt6-qtbase-devel \
+            qtkeychain-qt6-devel openssl-devel zlib-devel gperf ca-certificates
+      - uses: actions/checkout@v4
+      - name: Build the TDLib JSON runtime
+        run: |
+          git init /tmp/tdlib
+          git -C /tmp/tdlib fetch --depth 1 https://github.com/tdlib/td.git "$TDLIB_REF"
+          git -C /tmp/tdlib checkout --detach FETCH_HEAD
+          cmake -S /tmp/tdlib -B /tmp/tdlib/build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DTD_ENABLE_LTO=OFF -DTD_INSTALL_STATIC_LIBRARIES=OFF
+          cmake --build /tmp/tdlib/build --target tdjson --parallel 2
+      - name: Build, test and create RPM
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DPHOSCHAT_ENABLE_PACKAGING=ON \
+            -DCMAKE_INSTALL_LIBDIR=lib64 \
+            -DPHOSCHAT_TDLIB_RUNTIME=/tmp/tdlib/build/libtdjson.so \
+            -DPHOSCHAT_TDLIB_LICENSE=/tmp/tdlib/LICENSE_1_0.txt
+          cmake --build build --parallel 2
+          ctest --test-dir build --output-on-failure
+          cpack --config build/CPackConfig.cmake -G RPM -B dist
+      - name: Install and smoke test RPM
+        run: |
+          dnf install -y --nogpgcheck ./dist/phoschat-*.rpm
+          test -f /usr/lib64/phoschat/libtdjson.so
+          QT_QPA_PLATFORM=offscreen phoschat --version | grep -F "PhosChat ${{ needs.version.outputs.number }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: phoschat-rpm
+          path: dist/phoschat-*.rpm
+          if-no-files-found: error
+
+  windows:
+    runs-on: windows-2022
+    needs: version
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          arch: win64_msvc2022_64
+          cache: true
+      - name: Install NSIS
+        shell: pwsh
+        run: |
+          choco install nsis --no-progress -y
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "${env:ProgramFiles(x86)}\NSIS" >> $env:GITHUB_PATH
+      - name: Build QtKeychain and TDLib dependencies
+        shell: pwsh
+        run: ./packaging/windows/build-dependencies.ps1
+      - name: Build, test and create Windows installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $prefix = "$env:PHOSCHAT_DEPENDENCY_PREFIX;$env:QT_ROOT_DIR"
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DPHOSCHAT_ENABLE_PACKAGING=ON `
+            "-DCMAKE_PREFIX_PATH=$prefix" "-DPHOSCHAT_TDLIB_RUNTIME=$env:PHOSCHAT_TDLIB_DLL" `
+            "-DPHOSCHAT_TDLIB_LICENSE=$env:PHOSCHAT_TDLIB_LICENSE" `
+            "-DPHOSCHAT_WINDOWS_LICENSE_DIR=$env:PHOSCHAT_WINDOWS_LICENSE_DIR"
+          cmake --build build --parallel 2
+          ctest --test-dir build --output-on-failure
+          cpack --config build/CPackConfig.cmake -G NSIS -B dist
+      - name: Install and smoke test EXE
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $install = Join-Path $env:RUNNER_TEMP phoschat-install
+          $installer = Get-ChildItem dist/phoschat-*-windows-x64-setup.exe | Select-Object -First 1
+          if (!$installer) { throw 'Expected Windows installer is missing.' }
+          $setup = Start-Process $installer.FullName -ArgumentList '/S', "/D=$install" -Wait -PassThru
+          if ($setup.ExitCode -ne 0) { throw "Installer exited with $($setup.ExitCode)." }
+          foreach ($name in 'tdjson.dll', 'qwindows.dll', 'qsqlite.dll') {
+            if (!(Get-ChildItem $install -Recurse -Filter $name)) { throw "Missing installed file $name." }
+          }
+          $tdjson = Get-ChildItem $install -Recurse -Filter tdjson.dll | Select-Object -First 1
+          $tdlib = [System.Runtime.InteropServices.NativeLibrary]::Load($tdjson.FullName)
+          [System.Runtime.InteropServices.NativeLibrary]::GetExport($tdlib, 'td_create_client_id') | Out-Null
+          [System.Runtime.InteropServices.NativeLibrary]::Free($tdlib)
+          $env:QT_COMMAND_LINE_PARSER_NO_GUI_MESSAGE_BOXES = '1'
+          $versionFile = Join-Path $env:RUNNER_TEMP phoschat-version.txt
+          $app = Start-Process "$install/bin/phoschat.exe" -ArgumentList '--version' `
+            -RedirectStandardOutput $versionFile -PassThru
+          if (!$app.WaitForExit(15000)) {
+            $app.Kill()
+            throw 'PhosChat --version timed out.'
+          }
+          if ($app.ExitCode -ne 0) { throw "PhosChat exited with $($app.ExitCode)." }
+          if ((Get-Content $versionFile -Raw).Trim() -ne 'PhosChat ${{ needs.version.outputs.number }}') {
+            throw 'The installer did not contain the expected PhosChat version.'
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: phoschat-exe
+          path: dist/phoschat-*-windows-x64-setup.exe
+          if-no-files-found: error
+
+  flatpak:
+    runs-on: ubuntu-24.04
+    needs: version
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Flatpak SDK
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak flatpak-builder appstream-compose
+          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user --noninteractive --no-related flathub org.kde.Platform//6.10 org.kde.Sdk//6.10
+      - name: Build Flatpak bundle
+        run: |
+          flatpak-builder --user --force-clean --disable-rofiles-fuse --repo=repo build-flatpak packaging/flatpak/io.phoschat.desktop.json
+          mkdir -p dist
+          flatpak build-bundle --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo \
+            repo dist/phoschat-${{ needs.version.outputs.number }}-x86_64.flatpak io.phoschat.desktop
+      - name: Install and smoke test Flatpak
+        run: |
+          flatpak install --user --noninteractive dist/phoschat-*.flatpak
+          flatpak run --env=QT_QPA_PLATFORM=offscreen io.phoschat.desktop --version | grep -F "PhosChat ${{ needs.version.outputs.number }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: phoschat-flatpak
+          path: dist/phoschat-*.flatpak
+          if-no-files-found: error
+
+  publish:
+    needs: [version, debian, fedora, windows, flatpak]
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: phoschat-*
+          merge-multiple: true
+          path: dist
+      - name: Publish tagged prerelease and checksums
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.version.outputs.number }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          deb=(phoschat_*.deb)
+          rpm=(phoschat-*.rpm)
+          exe=(phoschat-*-windows-x64-setup.exe)
+          flatpak=(phoschat-*.flatpak)
+          for count in "${#deb[@]}" "${#rpm[@]}" "${#exe[@]}" "${#flatpak[@]}"; do
+            [[ "$count" == 1 ]]
+          done
+          assets=("${deb[@]}" "${rpm[@]}" "${exe[@]}" "${flatpak[@]}")
+          sha256sum "${assets[@]}" > SHA256SUMS
+          if gh release view "v$VERSION" --json tagName >/dev/null 2>&1; then
+            echo "Release v$VERSION already exists. Increase the release version before publishing again."
+            exit 1
+          fi
+          if git_ref_sha="$(gh api "repos/$GH_REPO/git/ref/tags/v$VERSION" --jq '.object.sha' 2>/dev/null)"; then
+            if [[ "$git_ref_sha" != "$GITHUB_SHA" && "$GITHUB_REF_TYPE" != tag ]]; then
+              echo "Existing v$VERSION tag does not match this build." >&2
+              exit 1
+            fi
+          fi
+          gh release create "v$VERSION" "${assets[@]}" SHA256SUMS \
+            --target "$GITHUB_SHA" --title "PhosChat v$VERSION preview" --prerelease \
+            --notes-file ../packaging/release-notes.md --generate-notes
