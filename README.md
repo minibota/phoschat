@@ -50,7 +50,7 @@ Use the [releases page](https://github.com/minibota/phoschat/releases) to check 
 | Linux with Flatpak | `.flatpak` | `flatpak install --user ./phoschat-*.flatpak` |
 | Windows x64 | `.exe` | Run the setup executable. |
 
-The macOS job checks compilation and tests. A signed and notarized installer is outside the v0.2 release. See [packaging](docs/packaging.md) for prerequisites, unsigned package details and checksums.
+The macOS preview job checks compilation, the IRC parser and plain loopback connection, and the other five test suites. Trusted IRC TLS with Secure Transport and a signed macOS installer remain future work. See [packaging](docs/packaging.md) for prerequisites, unsigned package details and checksums.
 
 ## Start with IRC
 

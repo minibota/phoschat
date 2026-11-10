@@ -32,6 +32,14 @@ jobs:
         if: runner.os == 'Windows'
       - run: cmake --preset debug -DPHOSCHAT_USE_KEYCHAIN=OFF
       - run: cmake --build --preset debug --parallel 2
-      - run: ctest --preset debug
+      - name: Run complete test suite
+        if: runner.os != 'macOS'
+        run: ctest --preset debug
+      - name: Run macOS preview checks
+        if: runner.os == 'macOS'
+        run: |
+          ctest --preset debug -E '^phoschat[.]irc$'
+          build/debug/test_irc parsesAndBoundsFrames foldsNamesAndStripsFormatting \
+            legacyPlaintextRegistration listsPublicChannels boundsChannelDirectory searchesCuratedDirectory
       - run: cmake --preset release -DBUILD_TESTING=OFF -DPHOSCHAT_USE_KEYCHAIN=OFF
       - run: cmake --build --preset release --parallel 2

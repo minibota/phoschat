@@ -1,8 +1,9 @@
 # Packaging PhosChat
 
 The x86-64 release publishes a Debian 13 DEB, Fedora 45 RPM, a Windows
-NSIS installer, and a Flatpak. The CI workflow includes a macOS build and test target. Release packaging
-currently targets Windows and Linux.
+NSIS installer, and a Flatpak. The macOS preview job compiles the app and
+runs the IRC parser, plain loopback and the other five suites. Trusted IRC TLS
+with Secure Transport and signed macOS packaging remain future work.
 
 | Package | Install |
 | --- | --- |

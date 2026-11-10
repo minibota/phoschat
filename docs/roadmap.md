@@ -5,7 +5,7 @@
 - Keep the compact list and independent chat windows as the core interaction. Offer dark and light phosphor themes with the same branding.
 - Browse IRC channels live with server `LIST` and curated suggestions for different topics. Verify public-network behavior in addition to the reproducible loopback fixtures.
 - Evaluate Telegram cloud text chats and approved Slack workspaces using the preview adapters. Live account verification, long-running sessions and reconnect behavior are gates for broader availability.
-- Build Debian, Fedora, Flatpak and Windows installers through the release workflow. Keep macOS compilation and tests in CI while signed packaging remains future work.
+- Build Debian, Fedora, Flatpak and Windows installers through the release workflow. Keep macOS compilation and preview checks in CI while trusted IRC TLS and signed packaging remain future work.
 
 ## Next · Conversation workflow and provider reliability
 
