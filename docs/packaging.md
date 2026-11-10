@@ -64,7 +64,9 @@ maintainer can reuse the four successful installer artifacts. Download them from
 that same run, put the installers in one directory, and generate `SHA256SUMS`
 with `sha256sum`. Use an authenticated GitHub CLI session to publish the
 prerelease and attach the four packages and `SHA256SUMS`. Target the exact
-commit shown on the packaging run so the tag and the built source match.
+commit shown on the packaging run so the tag and the built source match. If that
+commit has a different workflow from `main`, publish against an authorized
+release branch at the same commit, such as `release/v0.2.0`. [GitHub release API](https://docs.github.com/en/rest/releases/releases#create-a-release)
 
 The matching GitHub tag contains the corresponding source. Packages include
 the project license and applicable dependency notices. See
