@@ -7,3 +7,5 @@
 /CMakeUserPresets.json
 *.user
 __pycache__/
+/.phoschat-build-credentials.json*
+/packaging/flatpak/io.phoschat.desktop.private.json*

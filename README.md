@@ -33,11 +33,11 @@ The screenshots show the running desktop app connected to the local IRC demo. Sw
 | Protocol | Status | Available in this build |
 | --- | --- | --- |
 | **IRC / IRCv3** | Available | TLS and SASL, channels, private messages, participants, mentions, reconnect and local history. |
-| **Telegram** | Preview | Official TDLib, sign-in to an existing account, cloud direct and group chats, text and recent history. Requires TDLib and your own API ID and hash. |
+| **Telegram** | Preview | Official TDLib, phone sign-in in configured builds, direct chats, main and archived groups, text and recent history. v0.2.0 installers still require your own API ID/hash. |
 | **Slack** | Preview | Official Web API, browser PKCE for an approved workspace app or an authorized user token, channel and DM discovery, text and rate-limited history for the last opened conversation. |
 | **Matrix** | Later | Planned after the Telegram and Slack integrations mature. |
 
-Telegram and Slack require their own provider setup. The previews have automated adapter tests. Live sign-in and sustained messaging in an actual Telegram account or approved Slack workspace are separate verification steps. Telegram channels, secret chats, files and Slack threads are outside this preview. See the [Telegram](docs/telegram.md) and [Slack](docs/slack.md) guides for the supported scope.
+Configured Telegram builds use PhosChat's application identity, so users sign in to their own account without creating an API application. Slack requires an approved workspace application. The previews have automated adapter tests. Live sign-in and sustained messaging in an actual Telegram account or approved Slack workspace are separate verification steps. Telegram broadcast channels, secret chats, files and Slack threads are outside this preview. See the [Telegram](docs/telegram.md) and [Slack](docs/slack.md) guides for supported scope and the differences from the published v0.2.0 installers.
 
 ## Install
 

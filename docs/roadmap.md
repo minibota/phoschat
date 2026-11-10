@@ -10,7 +10,7 @@
 ## Next · Conversation workflow and provider reliability
 
 - Add grouped tab hosts and detach/reintegrate tabs without losing a chat's controller, draft or unread state. Restore tab order and account for display changes.
-- Test Telegram verification, session recovery and account removal with authorized test accounts. Evaluate channel support only with the sponsored-message requirements met. Treat media and secret chats as separate capabilities.
+- Test Telegram phone sign-in, session-key migration and account removal with authorized test accounts. Verify main and archived groups in real accounts and resolve effective send permissions for administrators and restricted members. Evaluate channel support only with the sponsored-message requirements met. Treat media and secret chats as separate capabilities.
 - Test Slack permissions, token rotation, revocation and rate limits in an approved workspace. Consider thread support and a compatible delivery architecture before expanding distribution.
 - Add an optional original notification sound and verify desktop notification delivery. Evaluate IRC remote history with a compatible server or bouncer.
 - Verify accessibility, HiDPI, multi-monitor restoration, startup time and memory with realistic accounts.

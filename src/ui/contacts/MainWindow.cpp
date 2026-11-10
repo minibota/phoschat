@@ -596,7 +596,7 @@ void MainWindow::reloadConversations()
             sections.insert(key, section);
         }
         auto *item = new QTreeWidgetItem(section);
-        const bool channel = conversation.kind == ConversationKind::Channel;
+        const bool channel = conversation.kind != ConversationKind::Direct;
         item->setText(0,
             (m_grouping != Grouping::Account || conversation.favorite) && !accountName.isEmpty()
                 ? tr("%1 · %2").arg(conversation.title, accountName)

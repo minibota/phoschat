@@ -3,6 +3,8 @@ project(PhosChat VERSION 0.2.0 LANGUAGES CXX)
 
 include(CTest)
 include(GNUInstallDirs)
+include(cmake/TelegramCredentials.cmake)
+phoschat_configure_telegram_credentials("${PROJECT_BINARY_DIR}/generated")
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -42,9 +44,12 @@ add_library(phoschat_core STATIC
     src/providers/telegram/telegram_provider.cpp
     src/providers/telegram/telegram_transport.cpp
     src/security/credential_store.cpp
+    src/security/telegram_app_credentials.cpp
+    src/security/telegram_credentials.cpp
     src/storage/database.cpp
 )
 target_include_directories(phoschat_core PUBLIC src)
+target_include_directories(phoschat_core PRIVATE "${PROJECT_BINARY_DIR}/generated")
 target_link_libraries(phoschat_core PUBLIC Qt6::Core Qt6::Network Qt6::Sql)
 if(PHOSCHAT_USE_KEYCHAIN AND TARGET qt6keychain)
     target_link_libraries(phoschat_core PRIVATE qt6keychain)
@@ -86,7 +91,7 @@ install(TARGETS phoschat RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}" BUNDLE DE
 
 if(BUILD_TESTING)
     find_package(Qt6 6.8 REQUIRED COMPONENTS Test)
-    foreach(suite IN ITEMS irc storage core telegram slack)
+    foreach(suite IN ITEMS irc storage core telegram telegram_credentials slack)
         add_executable(test_${suite} tests/test_${suite}.cpp)
         target_link_libraries(test_${suite} PRIVATE phoschat_core Qt6::Test)
         phoschat_warnings(test_${suite})

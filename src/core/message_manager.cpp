@@ -78,7 +78,8 @@ bool MessageManager::send(const ConversationId &id, const QString &text)
         return provider->sendCommand(id, text);
     }
     if (!canSend(id)) {
-        emit errorOccurred(tr("Join the channel before sending a message."));
+        emit errorOccurred(irc ? tr("Join the channel before sending a message.")
+                               : tr("Sending is unavailable in this conversation."));
         return false;
     }
     return provider->sendText(id, irc && text.startsWith(QStringLiteral("//")) ? text.mid(1) : text);

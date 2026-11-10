@@ -2,19 +2,26 @@
 #include "core/conversation_manager.h"
 #include "core/message_manager.h"
 #include "security/credential_store.h"
+#include "security/telegram_app_credentials.h"
 #include "storage/database.h"
 #include "ui/contacts/MainWindow.hpp"
+#include "ui/settings/AccountDialog.hpp"
 #include "ui/styles/Theme.hpp"
 #include "ui/windows/ChatWindow.hpp"
 #include "ui/windows/WindowManager.hpp"
 
 #include <QAction>
 #include <QApplication>
+#include <QCheckBox>
+#include <QComboBox>
 #include <QLineEdit>
 #include <QListView>
+#include <QPushButton>
 #include <QSettings>
 #include <QSignalSpy>
 #include <QTemporaryDir>
+#include <QToolButton>
+#include <QTreeWidget>
 #include <QtTest>
 #include <algorithm>
 
@@ -44,6 +51,10 @@ private slots:
     void initTestCase();
     void independentWindowsRestoreAndReuse();
     void mainGeometryWhileHiddenToTray();
+    void searchAndConversationFocusChrome_data();
+    void searchAndConversationFocusChrome();
+    void telegramOnboardingUsesBuildCredentials();
+    void existingTelegramApplicationIdentityIsPreserved();
 
 private:
     QTemporaryDir settingsDirectory_;
@@ -193,6 +204,141 @@ void UiTest::mainGeometryWhileHiddenToTray()
     }
     MainWindow restored(accounts, conversations, windows);
     QCOMPARE(restored.size(), expected);
+}
+
+void UiTest::searchAndConversationFocusChrome_data()
+{
+    QTest::addColumn<bool>("lightTheme");
+    QTest::newRow("dark") << false;
+    QTest::newRow("light") << true;
+}
+
+void UiTest::searchAndConversationFocusChrome()
+{
+    QFETCH(bool, lightTheme);
+    applyTheme(*qApp, lightTheme ? Theme::Light : Theme::Dark);
+    Database database(u":memory:"_s);
+    QVERIFY(database.open());
+    Account account;
+    account.id = u"chrome"_s;
+    account.protocol = Protocol::Telegram;
+    account.label = u"Telegram"_s;
+    QVERIFY(database.saveAccount(account));
+    Conversation group;
+    group.id = { account.id, u"-10042"_s };
+    group.title = u"PhosChat group"_s;
+    group.kind = ConversationKind::Group;
+    QVERIFY(database.saveConversation(group));
+
+    CredentialStore credentials;
+    AccountManager accounts(database, credentials);
+    ConversationManager conversations(accounts, database);
+    MessageManager messages(accounts, conversations, database);
+    WindowManager windows(accounts, conversations, messages);
+    MainWindow main(accounts, conversations, windows);
+    main.show();
+    auto *search = main.findChild<QLineEdit *>();
+    auto *tree = main.findChild<QTreeWidget *>();
+    QVERIFY(search && tree);
+    search->setText(u"Phos"_s);
+    QTRY_COMPARE(tree->topLevelItemCount(), 1);
+    QCOMPARE(tree->topLevelItem(0)->childCount(), 1);
+
+    const auto buttons = search->findChildren<QToolButton *>();
+    QCOMPARE(buttons.size(), 2); // The leading magnifier and trailing clear action.
+    for (const auto *button : buttons) {
+        QTRY_VERIFY(button->isVisible());
+        QVERIFY(search->rect().contains(button->geometry()));
+        QVERIFY(qAbs(button->geometry().center().y() - search->rect().center().y()) <= 1);
+    }
+    auto *item = tree->topLevelItem(0)->child(0);
+    QCOMPARE(item->icon(0).pixmap(18, 18).toImage(), conversationIcon(true).pixmap(18, 18).toImage());
+    tree->setCurrentItem(item);
+    tree->setFocus();
+    QTRY_VERIFY(tree->hasFocus());
+    QCOMPARE(tree->frameWidth(), 0);
+    QVERIFY(item->isSelected());
+    search->setFocus();
+    QTRY_VERIFY(search->hasFocus());
+    QCOMPARE(tree->frameWidth(), 0);
+    QVERIFY(item->isSelected());
+    applyTheme(*qApp, Theme::Dark);
+}
+
+void UiTest::telegramOnboardingUsesBuildCredentials()
+{
+    Database database(u":memory:"_s);
+    QVERIFY(database.open());
+    CredentialStore credentials;
+    AccountManager accounts(database, credentials);
+    AccountDialog dialog(accounts);
+    dialog.show();
+    auto *protocol = dialog.findChild<QComboBox *>(u"protocolSelector"_s);
+    auto *applicationId = dialog.findChild<QLineEdit *>(u"providerApplicationId"_s);
+    auto *credential = dialog.findChild<QLineEdit *>(u"providerCredential"_s);
+    auto *custom = dialog.findChild<QCheckBox *>(u"customTelegramApplication"_s);
+    auto *remember = dialog.findChild<QCheckBox *>(u"rememberSession"_s);
+    auto *save = dialog.findChild<QPushButton *>(u"saveAccount"_s);
+    QVERIFY(protocol && applicationId && credential && custom && remember && save);
+    protocol->setCurrentIndex(protocol->findData(static_cast<int>(Protocol::Telegram)));
+    const bool bundled = bundledTelegramCredentialsAvailable();
+    QCOMPARE(applicationId->isVisible(), !bundled);
+    QCOMPARE(credential->isVisible(), !bundled);
+    QCOMPARE(custom->isVisible(), bundled);
+    QCOMPARE(remember->isChecked(), accounts.persistentSecretsAvailable());
+    QCOMPARE(remember->text(), u"Remember this Telegram session"_s);
+    remember->setChecked(false); // Exercise a session-only account without touching the desktop keychain.
+    if (bundled) {
+        custom->setChecked(true);
+        QVERIFY(applicationId->isVisible());
+        QVERIFY(credential->isVisible());
+        QVERIFY(!remember->isChecked());
+        applicationId->setText(u"123456"_s);
+        credential->setText(u"0123456789abcdef0123456789abcdef"_s);
+        custom->setChecked(false);
+        QVERIFY(!applicationId->isVisible());
+        QVERIFY(!credential->isVisible());
+        QVERIFY(!remember->isChecked());
+    } else {
+        applicationId->setText(u"123456"_s);
+        credential->setText(u"0123456789abcdef0123456789abcdef"_s);
+    }
+    save->click();
+    QCOMPARE(accounts.accounts().size(), 1);
+    const auto account = accounts.accounts().first();
+    QCOMPARE(account.protocol, Protocol::Telegram);
+    QCOMPARE(account.providerId, bundled ? QString {} : u"123456"_s);
+    QVERIFY(!account.saveSecret);
+    QVERIFY(!applicationId->isEnabled());
+    QVERIFY(custom->isHidden());
+}
+
+void UiTest::existingTelegramApplicationIdentityIsPreserved()
+{
+    Database database(u":memory:"_s);
+    QVERIFY(database.open());
+    Account account;
+    account.id = u"manual-telegram"_s;
+    account.label = u"My Telegram"_s;
+    account.protocol = Protocol::Telegram;
+    account.providerId = u"123456"_s;
+    QVERIFY(database.saveAccount(account));
+    CredentialStore credentials;
+    AccountManager accounts(database, credentials);
+    AccountDialog dialog(accounts);
+    dialog.show();
+    auto *applicationId = dialog.findChild<QLineEdit *>(u"providerApplicationId"_s);
+    auto *credential = dialog.findChild<QLineEdit *>(u"providerCredential"_s);
+    auto *custom = dialog.findChild<QCheckBox *>(u"customTelegramApplication"_s);
+    auto *remember = dialog.findChild<QCheckBox *>(u"rememberSession"_s);
+    QVERIFY(applicationId && credential && custom && remember);
+    QVERIFY(applicationId->isVisible());
+    QVERIFY(credential->isVisible());
+    QCOMPARE(applicationId->text(), account.providerId);
+    QVERIFY(!applicationId->isEnabled());
+    QVERIFY(custom->isChecked());
+    QVERIFY(custom->isHidden());
+    QVERIFY(!remember->isChecked());
 }
 
 QTEST_MAIN(UiTest)

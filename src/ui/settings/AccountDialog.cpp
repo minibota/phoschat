@@ -1,6 +1,7 @@
 #include "ui/settings/AccountDialog.hpp"
 
 #include "core/account_manager.h"
+#include "security/telegram_app_credentials.h"
 #include "ui/Presentation.hpp"
 
 #include <QCheckBox>
@@ -43,8 +44,10 @@ AccountDialog::AccountDialog(AccountManager &accounts, QWidget *parent)
 
     auto *selector = new QFormLayout;
     m_account = new QComboBox;
+    m_account->setObjectName(QStringLiteral("accountSelector"));
     selector->addRow(tr("&Account"), m_account);
     m_protocol = new QComboBox;
+    m_protocol->setObjectName(QStringLiteral("protocolSelector"));
     for (const auto protocol : { Protocol::Irc, Protocol::Telegram, Protocol::Slack })
         m_protocol->addItem(protocolLabel(protocol), static_cast<int>(protocol));
     selector->addRow(tr("&Protocol"), m_protocol);
@@ -96,12 +99,17 @@ AccountDialog::AccountDialog(AccountManager &accounts, QWidget *parent)
 
     m_cloudSettings = new QGroupBox(tr("Provider setup"));
     auto *cloud = new QFormLayout(m_cloudSettings);
+    m_customTelegramApplication = new QCheckBox(tr("Use your own Telegram application (advanced)"));
+    m_customTelegramApplication->setObjectName(QStringLiteral("customTelegramApplication"));
+    cloud->addRow(m_customTelegramApplication);
     m_providerId = new QLineEdit;
+    m_providerId->setObjectName(QStringLiteral("providerApplicationId"));
     m_providerId->setMaxLength(96);
     m_providerIdLabel = new QLabel;
     m_providerIdLabel->setBuddy(m_providerId);
     cloud->addRow(m_providerIdLabel, m_providerId);
     m_cloudSecret = new QLineEdit;
+    m_cloudSecret->setObjectName(QStringLiteral("providerCredential"));
     m_cloudSecret->setEchoMode(QLineEdit::Password);
     m_cloudSecret->setInputMethodHints(Qt::ImhHiddenText | Qt::ImhSensitiveData | Qt::ImhNoPredictiveText);
     m_cloudSecret->setMaxLength(4096);
@@ -116,6 +124,7 @@ AccountDialog::AccountDialog(AccountManager &accounts, QWidget *parent)
     content->addWidget(m_cloudSettings);
 
     m_remember = new QCheckBox(tr("Remember in the system credential store"));
+    m_remember->setObjectName(QStringLiteral("rememberSession"));
     m_remember->setEnabled(accounts.persistentSecretsAvailable());
     if (!m_remember->isEnabled()) {
         m_remember->setToolTip(tr("A supported system credential store is unavailable."));
@@ -145,7 +154,9 @@ AccountDialog::AccountDialog(AccountManager &accounts, QWidget *parent)
     m_remove = actions->addButton(tr("Remove"), QDialogButtonBox::DestructiveRole);
     m_disconnect = actions->addButton(tr("Disconnect"), QDialogButtonBox::ActionRole);
     auto *saveButton = actions->addButton(tr("Save"), QDialogButtonBox::ActionRole);
+    saveButton->setObjectName(QStringLiteral("saveAccount"));
     m_connectButton = actions->addButton(tr("Save && connect"), QDialogButtonBox::ActionRole);
+    m_connectButton->setObjectName(QStringLiteral("connectAccount"));
     m_connectButton->setProperty("role", QStringLiteral("primary"));
     for (auto *button : actions->buttons()) {
         if (auto *push = qobject_cast<QPushButton *>(button)) {
@@ -156,6 +167,7 @@ AccountDialog::AccountDialog(AccountManager &accounts, QWidget *parent)
 
     connect(m_account, &QComboBox::currentIndexChanged, this, &AccountDialog::loadSelected);
     connect(m_protocol, &QComboBox::currentIndexChanged, this, &AccountDialog::refreshProtocolFields);
+    connect(m_customTelegramApplication, &QCheckBox::toggled, this, &AccountDialog::refreshProtocolFields);
     connect(m_tls, &QCheckBox::toggled, this, [this](bool tls) {
         if (m_port->value() == (tls ? 6667 : 6697)) {
             m_port->setValue(tls ? 6697 : 6667);
@@ -229,6 +241,13 @@ void AccountDialog::loadSelected()
     m_saslUser->setText(account.saslUser);
     m_providerId->setText(account.providerId);
     m_providerId->setEnabled(isNew);
+    {
+        const QSignalBlocker customBlocker(m_customTelegramApplication);
+        m_customTelegramApplication->setChecked(
+            !account.providerId.isEmpty() || (isNew && !bundledTelegramCredentialsAvailable()));
+    }
+    m_customTelegramApplication->setEnabled(isNew);
+    m_telegramDefaultsApplied = !isNew;
     m_remember->setChecked(account.saveSecret);
     m_autoConnect->setChecked(account.autoConnect);
     m_password->clear();
@@ -244,29 +263,62 @@ void AccountDialog::refreshProtocolFields()
     const auto protocol = static_cast<Protocol>(m_protocol->currentData().toInt());
     const bool irc = protocol == Protocol::Irc;
     const bool telegram = protocol == Protocol::Telegram;
+    const bool existing = !m_account->currentData().toString().isEmpty();
+    const bool bundled = bundledTelegramCredentialsAvailable();
+    const bool customTelegram = m_customTelegramApplication->isChecked();
+    const bool showProviderCredentials = !telegram || customTelegram;
+    if (telegram && !existing && !m_telegramDefaultsApplied) {
+        m_remember->setChecked(m_accounts.persistentSecretsAvailable());
+        m_telegramDefaultsApplied = true;
+    }
     m_ircNetwork->setVisible(irc);
     m_ircAuthentication->setVisible(irc);
     m_cloudSettings->setVisible(!irc);
+    m_cloudSettings->setTitle(telegram ? tr("Telegram sign-in") : tr("Provider setup"));
+    m_customTelegramApplication->setVisible(telegram && bundled && !existing);
+    m_providerIdLabel->setVisible(showProviderCredentials);
+    m_providerId->setVisible(showProviderCredentials);
+    m_cloudSecretLabel->setVisible(showProviderCredentials);
+    m_cloudSecret->setVisible(showProviderCredentials);
+    m_remember->setText(
+        telegram ? tr("Remember this Telegram session") : tr("Remember in the system credential store"));
     m_providerIdLabel->setText(telegram ? tr("API &ID") : tr("Client &ID"));
     m_cloudSecretLabel->setText(telegram ? tr("API &hash") : tr("User &token (optional)"));
     m_providerId->setPlaceholderText(telegram ? QStringLiteral("123456") : QStringLiteral("1234.5678"));
-    m_cloudSecret->setPlaceholderText(m_remember->isChecked() ? tr("Leave blank to keep the saved credential")
-            : telegram                                        ? QString {}
-                                                              : tr("Leave blank for browser sign-in"));
+    m_cloudSecret->setPlaceholderText(existing && m_remember->isChecked()
+            ? tr("Leave blank to keep the saved credential")
+            : telegram ? QString {}
+                       : tr("Leave blank for browser sign-in"));
     if (telegram) {
-        m_cloudHint->setText(m_accounts.protocolAvailable(protocol)
-                ? tr("Use the API ID and hash for your own application. Phone verification follows. "
-                     "<a href='https://github.com/minibota/phoschat/blob/main/docs/telegram.md'>Telegram "
-                     "setup</a>")
-                : tr("Telegram requires the official TDLib runtime. "
-                     "<a href='https://github.com/minibota/phoschat/blob/main/docs/telegram.md'>Installation "
-                     "guide</a>"));
+        if (!m_accounts.protocolAvailable(protocol)) {
+            m_cloudHint->setText(
+                tr("Telegram requires the official TDLib runtime. "
+                   "<a href='https://github.com/minibota/phoschat/blob/main/docs/telegram.md'>Installation "
+                   "guide</a>"));
+        } else if (!customTelegram && bundled) {
+            m_cloudHint->setText(tr("Sign in with your phone number and the code Telegram sends you. "
+                                    "Your two-step verification password may also be requested."));
+        } else if (!customTelegram) {
+            m_cloudHint->setText(tr("This build does not include the Telegram application credentials "
+                                    "used by this account. Use a build configured for PhosChat Telegram "
+                                    "sign-in."));
+        } else {
+            m_cloudHint->setText(bundled
+                    ? tr("Enter your application's API ID and hash. Phone verification follows. "
+                         "<a href='https://github.com/minibota/phoschat/blob/main/docs/telegram.md'>Advanced "
+                         "setup</a>")
+                    : tr("This build does not include PhosChat's Telegram application credentials. "
+                         "Enter your own API ID and hash, then sign in with your phone number. "
+                         "<a href='https://github.com/minibota/phoschat/blob/main/docs/telegram.md'>Build "
+                         "and setup guide</a>"));
+        }
     } else {
         m_cloudHint->setText(
             tr("Use a PKCE-enabled Slack app approved for your workspace. "
                "<a href='https://github.com/minibota/phoschat/blob/main/docs/slack.md'>Slack setup</a>"));
     }
-    m_connectButton->setEnabled(m_accounts.protocolAvailable(protocol));
+    m_connectButton->setEnabled(
+        m_accounts.protocolAvailable(protocol) && (!telegram || customTelegram || bundled));
     refreshStatus();
 }
 
@@ -320,7 +372,7 @@ void AccountDialog::save(bool connectAfter)
         account.tls = m_tls->isChecked();
         account.nick = nick;
         account.saslUser = saslUser;
-    } else {
+    } else if (protocol != Protocol::Telegram || m_customTelegramApplication->isChecked()) {
         account.providerId = m_providerId->text().trimmed();
     }
     account.saveSecret = m_remember->isChecked();
@@ -328,6 +380,10 @@ void AccountDialog::save(bool connectAfter)
 
     auto password
         = protocol == Protocol::Irc ? m_password->text().toUtf8() : m_cloudSecret->text().trimmed().toUtf8();
+    if (protocol == Protocol::Telegram && !m_customTelegramApplication->isChecked()) {
+        password.fill('\0');
+        password.clear();
+    }
     const QScopedValueRollback saving(m_savingAccountId, account.id);
     const bool saved = m_accounts.saveAccount(account, password);
     password.fill('\0');

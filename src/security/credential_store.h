@@ -8,7 +8,7 @@
 
 namespace phoschat {
 
-class CredentialStore final : public QObject {
+class CredentialStore : public QObject {
     Q_OBJECT
 
 public:
@@ -18,10 +18,10 @@ public:
     using QObject::QObject;
 
     // Reports build support. The desktop keychain may still reject an operation.
-    [[nodiscard]] bool persistentAvailable() const;
-    void read(const QString &accountId, ReadCallback callback);
-    void write(const QString &accountId, const QByteArray &secret, WriteCallback callback);
-    void remove(const QString &accountId, WriteCallback callback);
+    [[nodiscard]] virtual bool persistentAvailable() const;
+    virtual void read(const QString &accountId, ReadCallback callback);
+    virtual void write(const QString &accountId, const QByteArray &secret, WriteCallback callback);
+    virtual void remove(const QString &accountId, WriteCallback callback);
 };
 
 } // namespace phoschat

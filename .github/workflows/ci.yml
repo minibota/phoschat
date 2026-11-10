@@ -43,3 +43,17 @@ jobs:
             legacyPlaintextRegistration listsPublicChannels boundsChannelDirectory searchesCuratedDirectory
       - run: cmake --preset release -DBUILD_TESTING=OFF -DPHOSCHAT_USE_KEYCHAIN=OFF
       - run: cmake --build --preset release --parallel 2
+      - name: Check private build input validation
+        if: runner.os == 'Linux'
+        run: python3 tests/test_build_credentials.py
+      - name: Configure bundled identity with test-only values
+        env:
+          PHOSCHAT_TELEGRAM_API_ID: '12345'
+          PHOSCHAT_TELEGRAM_API_HASH: '0123456789abcdef0123456789abcdef'
+        run: >-
+          cmake -S . -B build/bundled -G Ninja -DCMAKE_BUILD_TYPE=Debug
+          -DPHOSCHAT_USE_KEYCHAIN=OFF -DPHOSCHAT_REQUIRE_TELEGRAM_APP_CREDENTIALS=ON
+      - name: Build bundled sign-in tests
+        run: cmake --build build/bundled --target test_telegram_credentials test_ui test_core --parallel 2
+      - name: Test bundled sign-in without network accounts
+        run: ctest --test-dir build/bundled --output-on-failure -R '^phoschat[.](telegram_credentials|ui|core)$'

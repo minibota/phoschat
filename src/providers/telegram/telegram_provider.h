@@ -1,11 +1,13 @@
 #pragma once
 
 #include "core/chat_provider.h"
+#include "security/telegram_credentials.h"
 
 #include <QHash>
 #include <QJsonObject>
 #include <QSet>
 
+#include <array>
 #include <optional>
 
 namespace phoschat {
@@ -45,18 +47,25 @@ private:
         bool autoDeletes {};
     };
 
+    struct ChatListLoad {
+        bool pending {};
+        bool complete {};
+    };
+
     void setState(ConnectionState state);
     void reset();
     void processEvent(const QJsonObject &event);
     void processResult(const QJsonObject &event);
     void processAuthorization(const QJsonObject &state);
     void sendParameters();
+    void finishKeyMigration();
+    void rotateSessionKeyIfReady();
     void prompt(AuthenticationKind kind, const QString &detail = {});
     void fail(const QString &message, bool retryable = false);
     void request(QJsonObject object, const QString &operation, qint64 chatId = 0);
     void updateConnectionState();
     void updateUser(const QJsonObject &user);
-    void loadMoreChats();
+    void loadMoreChats(bool archived);
     void acceptChat(const QJsonObject &chat);
     void announce(qint64 chatId, const Chat &chat);
     void acceptMessage(const QJsonObject &message, bool historical);
@@ -70,13 +79,20 @@ private:
     int client_ {};
     QString profile_;
     QByteArray apiHash_;
+    int apiId_ {};
+    TelegramCredentials credentials_;
+    QJsonObject pendingAuthorization_;
+    bool legacyKeyInUse_ {};
+    bool parametersPending_ {};
+    bool parametersConfigured_ {};
+    bool keyRotationPending_ {};
     qint64 owner_ {};
     std::optional<AuthenticationKind> challenge_;
     QString challengeDetail_;
     bool authenticationPending_ {};
     bool authorized_ {};
     bool networkReady_ {};
-    int pagesRequested_ {};
+    std::array<ChatListLoad, 2> chatLists_ {};
     QHash<qint64, Chat> chats_;
     QHash<qint64, QString> users_;
     QSet<qint64> historyPending_;

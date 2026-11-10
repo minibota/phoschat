@@ -1,13 +1,14 @@
 #include "providers/telegram/telegram_provider.h"
 
 #include "providers/telegram/telegram_transport.h"
+#include "security/telegram_app_credentials.h"
 
 #include <QCoreApplication>
+#include <QCryptographicHash>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonArray>
-#include <QMessageAuthenticationCode>
 #include <QRegularExpression>
 #include <QStandardPaths>
 #include <QSysInfo>
@@ -25,7 +26,6 @@ namespace {
 
     constexpr qint64 MaxTelegramInteger = 9007199254740991;
     constexpr int ChatPageSize = 100;
-    constexpr int MaxChatPages = 50;
     constexpr int HistoryLimit = 50;
 
     QString typeOf(const QJsonObject &object) { return object.value(u"@type"_s).toString(); }
@@ -66,18 +66,6 @@ namespace {
         return true;
     }
 
-    bool validApiHash(const QByteArray &secret)
-    {
-        if (secret.size() != 32)
-            return false;
-        for (const char value : secret) {
-            if (!((value >= '0' && value <= '9') || (value >= 'a' && value <= 'f')
-                    || (value >= 'A' && value <= 'F')))
-                return false;
-        }
-        return true;
-    }
-
     QString errorCode(const QJsonObject &response)
     {
         const auto code = response.value(u"code"_s).toInt();
@@ -106,7 +94,7 @@ TelegramProvider::~TelegramProvider()
 {
     if (client_ > 0)
         transport_.closeClient(client_);
-    apiHash_.fill('\0');
+    reset();
 }
 
 bool TelegramProvider::isAvailable() { return TelegramTransport::native().isAvailable(); }
@@ -133,10 +121,21 @@ void TelegramProvider::connectAccount(const QByteArray &secret)
         return;
     }
 
+    auto decoded = decodeTelegramCredentials(secret);
+    // Direct temporary provider clients may pass their own API hash. Persistent
+    // profiles must receive a keychain-backed envelope from AccountManager.
+    if (!decoded && !account_.saveSecret && validTelegramApiHash(secret))
+        decoded = newTelegramCredentials(secret);
+    if (!decoded) {
+        fail(tr("The saved Telegram session credential is invalid. Check account settings."));
+        return;
+    }
+    credentials_ = *decoded;
     bool apiIdValid = false;
-    const int apiId = account_.providerId.toInt(&apiIdValid);
-    if (!apiIdValid || apiId <= 0 || !validApiHash(secret)) {
-        fail(tr("Enter a valid Telegram API ID and API hash in account settings."));
+    apiId_ = account_.providerId.isEmpty() ? bundledTelegramApiId() : account_.providerId.toInt(&apiIdValid);
+    apiHash_ = account_.providerId.isEmpty() ? bundledTelegramApiHash() : credentials_.apiHash;
+    if (apiId_ <= 0 || (!account_.providerId.isEmpty() && !apiIdValid) || !validTelegramApiHash(apiHash_)) {
+        fail(tr("This build needs a Telegram application ID and hash in advanced account settings."));
         return;
     }
 
@@ -157,7 +156,6 @@ void TelegramProvider::connectAccount(const QByteArray &secret)
         profile_ = temporary->path();
     }
 
-    apiHash_ = secret.toLower();
     client_ = transport_.createClient(profile_, std::move(temporary));
     if (client_ <= 0) {
         fail(tr("The previous Telegram session is still closing."), true);
@@ -183,6 +181,11 @@ bool TelegramProvider::sendText(const ConversationId &id, const QString &text)
 {
     const auto remoteId = chatId(id);
     const auto chat = chats_.constFind(remoteId);
+    if (chat != chats_.cend() && (chat->protectedContent || chat->autoDeletes)) {
+        emit notice(tr("This Telegram chat uses protected or auto-deleting messages. Open it in an "
+                       "official Telegram client; PhosChat does not yet support these messages."));
+        return false;
+    }
     if (state_ != ConnectionState::Connected || chat == chats_.cend() || !chat->canSend
         || chat->protectedContent || chat->autoDeletes) {
         emit notice(tr("This Telegram conversation is unavailable for sending."));
@@ -306,13 +309,23 @@ void TelegramProvider::reset()
     profile_.clear();
     apiHash_.fill('\0');
     apiHash_.clear();
+    apiId_ = 0;
+    credentials_.apiHash.fill('\0');
+    credentials_.databaseKey.fill('\0');
+    credentials_.legacyDatabaseKey.fill('\0');
+    credentials_ = {};
+    pendingAuthorization_ = {};
+    legacyKeyInUse_ = false;
+    parametersPending_ = false;
+    parametersConfigured_ = false;
+    keyRotationPending_ = false;
     owner_ = 0;
     challenge_.reset();
     challengeDetail_.clear();
     authenticationPending_ = false;
     authorized_ = false;
     networkReady_ = false;
-    pagesRequested_ = 0;
+    chatLists_ = {};
     chats_.clear();
     users_.clear();
     historyPending_.clear();
@@ -401,9 +414,30 @@ void TelegramProvider::processResult(const QJsonObject &event)
         else
             processAuthorization(event);
     } else if (operation == u"parameters") {
-        if (error)
+        parametersPending_ = false;
+        if (error && event.value(u"code"_s).toInt() == 401 && !credentials_.legacyDatabaseKey.isEmpty()
+            && !legacyKeyInUse_) {
+            legacyKeyInUse_ = true;
+            sendParameters();
+        } else if (error) {
             fail(tr("Telegram could not open the session (error %1). Check the API credentials.")
                     .arg(errorCode(event)));
+        } else if (legacyKeyInUse_) {
+            parametersConfigured_ = true;
+            rotateSessionKeyIfReady();
+        } else {
+            parametersConfigured_ = true;
+            apiHash_.fill('\0');
+            apiHash_.clear();
+            if (!credentials_.legacyDatabaseKey.isEmpty())
+                finishKeyMigration();
+        }
+    } else if (operation == u"database-key") {
+        if (error)
+            fail(tr("Could not upgrade Telegram session protection. Reconnect to retry (error %1).")
+                    .arg(errorCode(event)));
+        else
+            finishKeyMigration();
     } else if (operation == u"authentication" && error && challenge_) {
         authenticationPending_ = false;
         emit authenticationRequired(*challenge_,
@@ -416,15 +450,18 @@ void TelegramProvider::processResult(const QJsonObject &event)
             return;
         }
         updateUser(event);
-        for (auto chat = chats_.cbegin(); chat != chats_.cend(); ++chat)
-            announce(chat.key(), *chat);
         updateConnectionState();
-        loadMoreChats();
-    } else if (operation == u"chats") {
-        if (!error)
-            loadMoreChats();
-        else if (event.value(u"code"_s).toInt() != 404)
+    } else if (operation == u"chats-main" || operation == u"chats-archive") {
+        const bool archived = operation == u"chats-archive";
+        auto &list = chatLists_[archived ? 1 : 0];
+        list.pending = false;
+        if (!error) {
+            loadMoreChats(archived);
+        } else if (event.value(u"code"_s).toInt() == 404) {
+            list.complete = true;
+        } else {
             emit notice(tr("Telegram could not finish loading chats (error %1).").arg(errorCode(event)));
+        }
     } else if (operation == u"chat") {
         chatPending_.remove(id);
         if (!error)
@@ -455,8 +492,16 @@ void TelegramProvider::processResult(const QJsonObject &event)
 void TelegramProvider::processAuthorization(const QJsonObject &state)
 {
     const auto type = typeOf(state);
+    // TDLib permits rekeying only after authorization. Existing profiles may
+    // require phone/code/password again; allow those steps, then protect the
+    // session before publishing any conversations or messages.
+    if (!credentials_.legacyDatabaseKey.isEmpty() && type == u"authorizationStateReady") {
+        pendingAuthorization_ = state;
+        rotateSessionKeyIfReady();
+        return;
+    }
     if (type == u"authorizationStateWaitTdlibParameters") {
-        if (!apiHash_.isEmpty())
+        if (!apiHash_.isEmpty() && !parametersPending_ && !parametersConfigured_)
             sendParameters();
     } else if (type == u"authorizationStateWaitPhoneNumber") {
         prompt(AuthenticationKind::Phone, tr("Enter your phone number with its country code."));
@@ -488,23 +533,43 @@ void TelegramProvider::processAuthorization(const QJsonObject &state)
 
 void TelegramProvider::sendParameters()
 {
-    const auto encryptionKey = QMessageAuthenticationCode::hash(
-        QByteArrayLiteral("PhosChat TDLib profile v1\0") + account_.id.toUtf8(),
-        QByteArray::fromHex(apiHash_), QCryptographicHash::Sha256);
+    parametersPending_ = true;
+    const auto &encryptionKey = legacyKeyInUse_ ? credentials_.legacyDatabaseKey : credentials_.databaseKey;
     const auto version = QCoreApplication::applicationVersion();
-    request(
-        { { u"@type"_s, u"setTdlibParameters"_s }, { u"use_test_dc"_s, false },
-            { u"database_directory"_s, profile_ }, { u"files_directory"_s, profile_ },
-            { u"database_encryption_key"_s, QString::fromLatin1(encryptionKey.toBase64()) },
-            { u"use_file_database"_s, false }, { u"use_chat_info_database"_s, false },
-            { u"use_message_database"_s, false }, { u"use_secret_chats"_s, false },
-            { u"api_id"_s, account_.providerId.toInt() }, { u"api_hash"_s, QString::fromLatin1(apiHash_) },
-            { u"system_language_code"_s, u"en"_s }, { u"device_model"_s, u"PhosChat Desktop"_s },
-            { u"system_version"_s, QSysInfo::prettyProductName() },
-            { u"application_version"_s, version.isEmpty() ? u"0.2.0"_s : version } },
+    request({ { u"@type"_s, u"setTdlibParameters"_s }, { u"use_test_dc"_s, false },
+                { u"database_directory"_s, profile_ }, { u"files_directory"_s, profile_ },
+                { u"database_encryption_key"_s, QString::fromLatin1(encryptionKey.toBase64()) },
+                { u"use_file_database"_s, false }, { u"use_chat_info_database"_s, false },
+                { u"use_message_database"_s, false }, { u"use_secret_chats"_s, false },
+                { u"api_id"_s, apiId_ }, { u"api_hash"_s, QString::fromLatin1(apiHash_) },
+                { u"system_language_code"_s, u"en"_s }, { u"device_model"_s, u"PhosChat Desktop"_s },
+                { u"system_version"_s, QSysInfo::prettyProductName() },
+                { u"application_version"_s, version.isEmpty() ? u"0.2.0"_s : version } },
         u"parameters"_s);
+}
+
+void TelegramProvider::finishKeyMigration()
+{
+    credentials_.legacyDatabaseKey.fill('\0');
+    credentials_.legacyDatabaseKey.clear();
+    legacyKeyInUse_ = false;
     apiHash_.fill('\0');
     apiHash_.clear();
+    emit credentialsUpdated(encodeTelegramCredentials(credentials_));
+    const auto pending = std::exchange(pendingAuthorization_, {});
+    if (!pending.isEmpty())
+        processAuthorization(pending);
+}
+
+void TelegramProvider::rotateSessionKeyIfReady()
+{
+    if (!parametersConfigured_ || !legacyKeyInUse_ || keyRotationPending_
+        || typeOf(pendingAuthorization_) != u"authorizationStateReady")
+        return;
+    keyRotationPending_ = true;
+    request({ { u"@type"_s, u"setDatabaseEncryptionKey"_s },
+                { u"new_encryption_key"_s, QString::fromLatin1(credentials_.databaseKey.toBase64()) } },
+        u"database-key"_s);
 }
 
 void TelegramProvider::prompt(AuthenticationKind kind, const QString &detail)
@@ -522,7 +587,16 @@ void TelegramProvider::updateConnectionState()
 {
     if (!authorized_ || !owner_)
         return;
+    const bool becameConnected = networkReady_ && state_ != ConnectionState::Connected;
     setState(networkReady_ ? ConnectionState::Connected : ConnectionState::Reconnecting);
+    if (becameConnected) {
+        // The core clears send availability while offline. Restore it for every
+        // known chat, even when TDLib has no changed chat metadata to publish.
+        for (auto chat = chats_.cbegin(); chat != chats_.cend(); ++chat)
+            announce(chat.key(), *chat);
+        loadMoreChats(false);
+        loadMoreChats(true);
+    }
 }
 
 void TelegramProvider::updateUser(const QJsonObject &user)
@@ -534,15 +608,19 @@ void TelegramProvider::updateUser(const QJsonObject &user)
         users_.insert(id, name);
 }
 
-void TelegramProvider::loadMoreChats()
+void TelegramProvider::loadMoreChats(bool archived)
 {
-    if (!owner_ || pagesRequested_ >= MaxChatPages)
+    auto &list = chatLists_[archived ? 1 : 0];
+    if (!owner_ || state_ != ConnectionState::Connected || list.pending || list.complete)
         return;
-    ++pagesRequested_;
+    list.pending = true;
+    // TDLib may return fewer chats than requested. Only its 404 result marks
+    // the end of each list; an arbitrary page cap can hide existing groups.
     request({ { u"@type"_s, u"loadChats"_s },
-                { u"chat_list"_s, QJsonObject { { u"@type"_s, u"chatListMain"_s } } },
+                { u"chat_list"_s,
+                    QJsonObject { { u"@type"_s, archived ? u"chatListArchive"_s : u"chatListMain"_s } } },
                 { u"limit"_s, ChatPageSize } },
-        u"chats"_s);
+        archived ? u"chats-archive"_s : u"chats-main"_s);
 }
 
 void TelegramProvider::acceptChat(const QJsonObject &object)
@@ -554,24 +632,37 @@ void TelegramProvider::acceptChat(const QJsonObject &object)
         || (type != u"chatTypePrivate" && type != u"chatTypeBasicGroup"
             && (type != u"chatTypeSupergroup" || kind.value(u"is_channel"_s).toBool())))
         return;
+    const auto title = object.value(u"title"_s).toString();
+    const auto conversationKind
+        = type == u"chatTypePrivate" ? ConversationKind::Direct : ConversationKind::Group;
+    const bool canSend
+        = object.value(u"permissions"_s).toObject().value(u"can_send_basic_messages"_s).toBool(true);
+    const bool protectedContent = object.value(u"has_protected_content"_s).toBool();
+    const bool autoDeletes = object.value(u"message_auto_delete_time"_s).toInt() > 0;
+    const auto known = chats_.constFind(id);
+    if (known != chats_.cend() && known->title == title && known->kind == conversationKind
+        && known->canSend == canSend && known->protectedContent == protectedContent
+        && known->autoDeletes == autoDeletes)
+        return;
     auto &chat = chats_[id];
-    chat.title = object.value(u"title"_s).toString();
-    chat.kind = type == u"chatTypePrivate" ? ConversationKind::Direct : ConversationKind::Group;
-    chat.canSend = object.value(u"permissions"_s).toObject().value(u"can_send_basic_messages"_s).toBool(true);
-    chat.protectedContent = object.value(u"has_protected_content"_s).toBool();
-    chat.autoDeletes = object.value(u"message_auto_delete_time"_s).toInt() > 0;
+    chat.title = title;
+    chat.kind = conversationKind;
+    chat.canSend = canSend;
+    chat.protectedContent = protectedContent;
+    chat.autoDeletes = autoDeletes;
     announce(id, chat);
 }
 
 void TelegramProvider::announce(qint64 chatId, const Chat &chat)
 {
-    if (!owner_ || chat.protectedContent || chat.autoDeletes)
+    if (!owner_)
         return;
     Conversation conversation;
     conversation.id = { account_.id, QString::number(owner_) + u'/' + QString::number(chatId) };
     conversation.title = chat.title.isEmpty() ? tr("Telegram conversation") : chat.title;
     conversation.kind = chat.kind;
-    conversation.joined = chat.canSend;
+    conversation.joined
+        = state_ == ConnectionState::Connected && chat.canSend && !chat.protectedContent && !chat.autoDeletes;
     emit conversationChanged(conversation);
 }
 
@@ -634,6 +725,9 @@ void TelegramProvider::fetchHistory(qint64 id)
     const auto chat = chats_.constFind(id);
     if (chat == chats_.cend() || chat->protectedContent || chat->autoDeletes) {
         historyPending_.remove(id);
+        if (chat != chats_.cend())
+            emit notice(tr("This Telegram chat uses protected or auto-deleting messages. Open it in an "
+                           "official Telegram client; PhosChat does not yet support these messages."));
         return;
     }
     request({ { u"@type"_s, u"getChatHistory"_s }, { u"chat_id"_s, id }, { u"from_message_id"_s, 0 },

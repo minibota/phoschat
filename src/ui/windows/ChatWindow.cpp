@@ -174,6 +174,8 @@ void ChatWindow::refreshComposer()
         m_composerHint->setText(irc ? tr("Enter to send · / for IRC commands") : tr("Enter to send"));
     } else if (online && irc) {
         m_composerHint->setText(tr("Join the channel to send messages. IRC commands are available."));
+    } else if (online) {
+        m_composerHint->setText(tr("Sending is unavailable in this conversation."));
     } else {
         m_composerHint->setText(tr("You can send once the account is connected."));
     }

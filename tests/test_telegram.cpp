@@ -61,6 +61,16 @@ public:
     QJsonObject last() const { return requests.last(); }
     QString lastType() const { return last().value(u"@type"_s).toString(); }
 
+    QJsonObject lastChatListRequest(const QString &listType) const
+    {
+        for (auto request = requests.crbegin(); request != requests.crend(); ++request) {
+            if (request->value(u"@type"_s).toString() == u"loadChats"
+                && request->value(u"chat_list"_s).toObject().value(u"@type"_s).toString() == listType)
+                return *request;
+        }
+        return {};
+    }
+
     void connected(qint64 owner)
     {
         network(u"connectionStateReady"_s);
@@ -112,6 +122,9 @@ class TelegramTest final : public QObject {
 private slots:
     void authenticatesAndSafeguardsTemporaryProfile();
     void mapsAndFiltersCloudText();
+    void loadsMainAndArchivedGroupsUntilBothListsFinish();
+    void resumesInterruptedDiscoveryAndRestoresGroupsAfterReconnect();
+    void keepsRestrictedGroupsVisibleWithoutReadingOrSending();
     void loadsNativeLibraryWhenInstalled();
 };
 
@@ -244,6 +257,149 @@ void TelegramTest::mapsAndFiltersCloudText()
     QCOMPARE(states.last().at(0).value<ConnectionState>(), ConnectionState::Reconnecting);
     transport.network(u"connectionStateReady"_s);
     QCOMPARE(states.last().at(0).value<ConnectionState>(), ConnectionState::Connected);
+}
+
+void TelegramTest::loadsMainAndArchivedGroupsUntilBothListsFinish()
+{
+    FakeTelegramTransport transport;
+    TelegramProvider provider(account(), transport);
+    QSignalSpy conversations(&provider, &IChatProvider::conversationChanged);
+    QSignalSpy notices(&provider, &IChatProvider::notice);
+    provider.connectAccount(TestApiHash);
+    transport.connected(42);
+
+    const auto main = transport.lastChatListRequest(u"chatListMain"_s);
+    const auto archive = transport.lastChatListRequest(u"chatListArchive"_s);
+    QVERIFY(!main.isEmpty());
+    QVERIFY(!archive.isEmpty());
+    QCOMPARE(main.value(u"limit"_s).toInt(), 100);
+    QCOMPARE(archive.value(u"limit"_s).toInt(), 100);
+
+    transport.publish(chat(-10, u"chatTypeBasicGroup"_s, u"Friends"_s));
+    const auto basic = conversations.last().first().value<Conversation>();
+    QCOMPARE(basic.kind, ConversationKind::Group);
+    QCOMPARE(basic.id.remoteId, u"42/-10"_s);
+    QVERIFY(basic.joined);
+    transport.publish(chat(-10020, u"chatTypeSupergroup"_s, u"Community"_s));
+    QCOMPARE(conversations.size(), 2);
+    transport.publish(chat(-10020, u"chatTypeSupergroup"_s, u"Community"_s));
+    QCOMPARE(conversations.size(), 2); // Repeated metadata must not duplicate discovery.
+
+    transport.publish(chat(-10030, u"chatTypeSupergroup"_s, u"Archived group"_s));
+    const auto archived = conversations.last().first().value<Conversation>();
+    QCOMPARE(archived.kind, ConversationKind::Group);
+    QVERIFY(provider.sendText(archived.id, u"Still a member"_s));
+    transport.reply(archive, { { u"@type"_s, u"ok"_s } });
+    QCOMPARE(
+        transport.last().value(u"chat_list"_s).toObject().value(u"@type"_s).toString(), u"chatListArchive"_s);
+    transport.reply(transport.lastChatListRequest(u"chatListArchive"_s),
+        { { u"@type"_s, u"error"_s }, { u"code"_s, 404 } });
+    const auto finishedArchive = transport.lastChatListRequest(u"chatListArchive"_s);
+
+    // Even a short page is not EOF. Previous releases silently stopped after
+    // 50 pages, although TDLib can return much less than the requested limit.
+    for (int page = 0; page < 55; ++page) {
+        const auto count = transport.requests.size();
+        transport.reply(transport.lastChatListRequest(u"chatListMain"_s), { { u"@type"_s, u"ok"_s } });
+        QCOMPARE(transport.requests.size(), count + 1);
+        QCOMPARE(transport.last().value(u"chat_list"_s).toObject().value(u"@type"_s).toString(),
+            u"chatListMain"_s);
+    }
+    transport.publish(chat(-10040, u"chatTypeSupergroup"_s, u"Older group"_s));
+    QCOMPARE(conversations.size(), 4);
+    const auto count = transport.requests.size();
+    transport.reply(
+        transport.lastChatListRequest(u"chatListMain"_s), { { u"@type"_s, u"error"_s }, { u"code"_s, 404 } });
+    QCOMPARE(transport.requests.size(), count);
+    QVERIFY(notices.isEmpty());
+    QCOMPARE(transport.lastChatListRequest(u"chatListArchive"_s), finishedArchive);
+
+    // Discovery must never unarchive/join groups or mark them read.
+    for (const auto &request : transport.requests) {
+        const auto type = request.value(u"@type"_s).toString();
+        QVERIFY(type != u"addChatToList" && type != u"joinChat" && type != u"viewMessages");
+    }
+}
+
+void TelegramTest::resumesInterruptedDiscoveryAndRestoresGroupsAfterReconnect()
+{
+    FakeTelegramTransport transport;
+    TelegramProvider provider(account(), transport);
+    QSignalSpy conversations(&provider, &IChatProvider::conversationChanged);
+    QSignalSpy notices(&provider, &IChatProvider::notice);
+    provider.connectAccount(TestApiHash);
+    transport.connected(42);
+    transport.publish(chat(-10, u"chatTypeBasicGroup"_s, u"Friends"_s));
+    const auto known = conversations.last().first().value<Conversation>();
+    transport.reply(transport.lastChatListRequest(u"chatListMain"_s),
+        { { u"@type"_s, u"error"_s }, { u"code"_s, 500 }, { u"message"_s, u"private details"_s } });
+    QCOMPARE(notices.size(), 1);
+    QVERIFY(!notices.last().first().toString().contains(u"private details"));
+    transport.reply(transport.lastChatListRequest(u"chatListArchive"_s),
+        { { u"@type"_s, u"error"_s }, { u"code"_s, 404 } });
+    const auto count = transport.requests.size();
+    transport.network(u"connectionStateWaitingForNetwork"_s);
+    QVERIFY(!provider.sendText(known.id, u"Offline"_s));
+    transport.network(u"connectionStateReady"_s);
+    QCOMPARE(transport.requests.size(), count + 1);
+    QCOMPARE(
+        transport.last().value(u"chat_list"_s).toObject().value(u"@type"_s).toString(), u"chatListMain"_s);
+    QCOMPARE(conversations.size(), 2);
+    QVERIFY(conversations.last().first().value<Conversation>().joined);
+    transport.network(u"connectionStateReady"_s);
+    QCOMPARE(transport.requests.size(), count + 1); // No duplicate in-flight page.
+    QCOMPARE(conversations.size(), 2);
+    QVERIFY(provider.sendText(known.id, u"Back online"_s));
+}
+
+void TelegramTest::keepsRestrictedGroupsVisibleWithoutReadingOrSending()
+{
+    FakeTelegramTransport transport;
+    TelegramProvider provider(account(), transport);
+    QSignalSpy conversations(&provider, &IChatProvider::conversationChanged);
+    QSignalSpy notices(&provider, &IChatProvider::notice);
+    QSignalSpy messages(&provider, &IChatProvider::messageReceived);
+    provider.connectAccount(TestApiHash);
+    transport.connected(42);
+
+    for (const auto &field : { u"has_protected_content"_s, u"message_auto_delete_time"_s }) {
+        const qint64 id = field == u"has_protected_content" ? -10 : -20;
+        auto event = chat(id, u"chatTypeBasicGroup"_s, u"Restricted group"_s);
+        auto value = event.value(u"chat"_s).toObject();
+        value.insert(field, field == u"has_protected_content" ? QJsonValue(true) : QJsonValue(86400));
+        event.insert(u"chat"_s, value);
+        const auto count = conversations.size();
+        transport.publish(event);
+        QCOMPARE(conversations.size(), count + 1);
+        const auto known = conversations.last().first().value<Conversation>();
+        QCOMPARE(known.kind, ConversationKind::Group);
+        QVERIFY(!known.joined);
+        const auto requests = transport.requests.size();
+        provider.requestHistory(known.id);
+        QVERIFY(!provider.sendText(known.id, u"Not supported yet"_s));
+        transport.publish(
+            { { u"@type"_s, u"updateNewMessage"_s }, { u"message"_s, message(id, 1, u"Private"_s) } });
+        QCOMPARE(transport.requests.size(), requests);
+        QVERIFY(messages.isEmpty());
+    }
+    QCOMPARE(notices.size(), 4);
+
+    // Group permission changes affect sending, without hiding the group.
+    transport.publish(chat(-30, u"chatTypeSupergroup"_s, u"Read-only group"_s));
+    transport.publish({ { u"@type"_s, u"updateChatPermissions"_s }, { u"chat_id"_s, -30 },
+        { u"permissions"_s, QJsonObject { { u"can_send_basic_messages"_s, false } } } });
+    const auto readonly = conversations.last().first().value<Conversation>();
+    QVERIFY(!readonly.joined);
+    QVERIFY(!provider.sendText(readonly.id, u"Unavailable"_s));
+    provider.requestHistory(readonly.id);
+    QCOMPARE(transport.lastType(), u"getChatHistory"_s);
+
+    // Broadcast sponsored messages and secret-chat lifecycles remain outside
+    // this preview; neither may leak ordinary text through the group path.
+    const auto count = conversations.size();
+    transport.publish(chat(-100, u"chatTypeSupergroup"_s, u"Broadcast"_s, true));
+    transport.publish(chat(-101, u"chatTypeSecret"_s, u"Secret"_s));
+    QCOMPARE(conversations.size(), count);
 }
 
 void TelegramTest::loadsNativeLibraryWhenInstalled()

@@ -32,6 +32,11 @@ jobs:
       number: ${{ steps.check.outputs.version }}
     steps:
       - uses: actions/checkout@v4
+      - name: Verify Telegram application configuration
+        env:
+          PHOSCHAT_TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          PHOSCHAT_TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+        run: python3 packaging/prepare-telegram-build.py
       - name: Verify release version
         id: check
         env:
@@ -63,9 +68,15 @@ jobs:
             desktop-file-utils dpkg-dev file git ninja-build qt6-base-dev libqt6sql6-sqlite \
             qtkeychain-qt6-dev
       - uses: actions/checkout@v4
+      - name: Configure DEB with the Telegram application identity
+        env:
+          PHOSCHAT_TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          PHOSCHAT_TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+        run: >-
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DPHOSCHAT_ENABLE_PACKAGING=ON
+          -DPHOSCHAT_REQUIRE_TELEGRAM_APP_CREDENTIALS=ON
       - name: Build, test and create DEB
         run: |
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DPHOSCHAT_ENABLE_PACKAGING=ON
           cmake --build build --parallel 2
           ctest --test-dir build --output-on-failure
           desktop-file-validate packaging/linux/io.phoschat.desktop.desktop
@@ -101,12 +112,18 @@ jobs:
           cmake -S /tmp/tdlib -B /tmp/tdlib/build -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DTD_ENABLE_LTO=OFF -DTD_INSTALL_STATIC_LIBRARIES=OFF
           cmake --build /tmp/tdlib/build --target tdjson --parallel 2
-      - name: Build, test and create RPM
+      - name: Configure RPM with the Telegram application identity
+        env:
+          PHOSCHAT_TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          PHOSCHAT_TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DPHOSCHAT_ENABLE_PACKAGING=ON \
             -DCMAKE_INSTALL_LIBDIR=lib64 \
             -DPHOSCHAT_TDLIB_RUNTIME=/tmp/tdlib/build/libtdjson.so \
-            -DPHOSCHAT_TDLIB_LICENSE=/tmp/tdlib/LICENSE_1_0.txt
+            -DPHOSCHAT_TDLIB_LICENSE=/tmp/tdlib/LICENSE_1_0.txt \
+            -DPHOSCHAT_REQUIRE_TELEGRAM_APP_CREDENTIALS=ON
+      - name: Build, test and create RPM
+        run: |
           cmake --build build --parallel 2
           ctest --test-dir build --output-on-failure
           cpack --config build/CPackConfig.cmake -G RPM -B dist
@@ -144,7 +161,10 @@ jobs:
       - name: Build QtKeychain and TDLib dependencies
         shell: pwsh
         run: ./packaging/windows/build-dependencies.ps1
-      - name: Build, test and create Windows installer
+      - name: Configure Windows with the Telegram application identity
+        env:
+          PHOSCHAT_TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          PHOSCHAT_TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -153,7 +173,13 @@ jobs:
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DPHOSCHAT_ENABLE_PACKAGING=ON `
             "-DCMAKE_PREFIX_PATH=$prefix" "-DPHOSCHAT_TDLIB_RUNTIME=$env:PHOSCHAT_TDLIB_DLL" `
             "-DPHOSCHAT_TDLIB_LICENSE=$env:PHOSCHAT_TDLIB_LICENSE" `
-            "-DPHOSCHAT_WINDOWS_LICENSE_DIR=$env:PHOSCHAT_WINDOWS_LICENSE_DIR"
+            "-DPHOSCHAT_WINDOWS_LICENSE_DIR=$env:PHOSCHAT_WINDOWS_LICENSE_DIR" `
+            -DPHOSCHAT_REQUIRE_TELEGRAM_APP_CREDENTIALS=ON
+      - name: Build, test and create Windows installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
           cmake --build build --parallel 2
           ctest --test-dir build --output-on-failure
           cpack --config build/CPackConfig.cmake -G NSIS -B dist
@@ -203,12 +229,20 @@ jobs:
           sudo apt-get install -y flatpak flatpak-builder appstream-compose
           flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
           flatpak install --user --noninteractive --no-related flathub org.kde.Platform//6.10 org.kde.Sdk//6.10
+      - name: Prepare private Flatpak build inputs
+        env:
+          PHOSCHAT_TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          PHOSCHAT_TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+        run: python3 packaging/prepare-telegram-build.py --flatpak
       - name: Build Flatpak bundle
         run: |
-          flatpak-builder --user --force-clean --disable-rofiles-fuse --repo=repo build-flatpak packaging/flatpak/io.phoschat.desktop.json
+          flatpak-builder --user --force-clean --disable-rofiles-fuse --repo=repo build-flatpak packaging/flatpak/io.phoschat.desktop.private.json
           mkdir -p dist
           flatpak build-bundle --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo \
             repo dist/phoschat-${{ needs.version.outputs.number }}-x86_64.flatpak io.phoschat.desktop
+      - name: Remove private Flatpak build inputs
+        if: always()
+        run: rm -f .phoschat-build-credentials.json packaging/flatpak/io.phoschat.desktop.private.json
       - name: Install and smoke test Flatpak
         run: |
           flatpak install --user --noninteractive dist/phoschat-*.flatpak

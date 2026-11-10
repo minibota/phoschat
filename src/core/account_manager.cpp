@@ -4,6 +4,8 @@
 #include "providers/slack/slack_provider.h"
 #include "providers/telegram/telegram_provider.h"
 #include "security/credential_store.h"
+#include "security/telegram_app_credentials.h"
+#include "security/telegram_credentials.h"
 #include "storage/database.h"
 
 #include <QPointer>
@@ -161,9 +163,9 @@ bool AccountManager::saveAccount(Account account, QByteArray secret)
     if (account.protocol == Protocol::Telegram) {
         bool validId = false;
         const int apiId = account.providerId.toInt(&validId);
-        static const QRegularExpression hash(QStringLiteral("^[0-9A-Fa-f]{32}$"));
-        if (!validId || apiId <= 0
-            || (!secret.isEmpty() && !hash.match(QString::fromLatin1(secret)).hasMatch())) {
+        const bool bundled = account.providerId.isEmpty() && bundledTelegramCredentialsAvailable();
+        if ((!bundled && (!validId || apiId <= 0))
+            || (!secret.isEmpty() && (bundled || !validTelegramApiHash(secret)))) {
             emit errorOccurred(account.id, tr("Enter a valid Telegram API ID and 32-character API hash."));
             return false;
         }
@@ -199,7 +201,8 @@ bool AccountManager::saveAccount(Account account, QByteArray secret)
             account.id, tr("Remove and recreate this Telegram account to change its saved API hash."));
         return false;
     }
-    if (!session && needsSecret(account) && account.protocol != Protocol::Irc && secret.isEmpty()) {
+    if (!session && needsSecret(account) && account.protocol != Protocol::Irc && secret.isEmpty()
+        && !(account.protocol == Protocol::Telegram && account.providerId.isEmpty())) {
         emit errorOccurred(account.id, tr("Enter the provider credential to add this account."));
         return false;
     }
@@ -214,6 +217,14 @@ bool AccountManager::saveAccount(Account account, QByteArray secret)
 
     if (secret.isEmpty() && session && !newCredentialIdentity)
         secret = session->secret;
+    if (account.protocol == Protocol::Telegram
+        && (!session || suppliedSecret
+            || (account.providerId.isEmpty() && !account.saveSecret && secret.isEmpty())))
+        secret = encodeTelegramCredentials(newTelegramCredentials(secret));
+    else if (account.protocol == Protocol::Telegram && eraseStored && !secret.isEmpty()) {
+        if (const auto saved = decodeTelegramCredentials(secret))
+            secret = encodeTelegramCredentials(newTelegramCredentials(saved->apiHash));
+    }
     const bool updateStored = account.saveSecret && !secret.isEmpty() && (!preserveStored || suppliedSecret);
     if (account.saveSecret
         && (!persistentSecretsAvailable() || (!preserveStored && secret.isEmpty() && needsSecret(account)))) {
@@ -254,6 +265,10 @@ bool AccountManager::saveAccount(Account account, QByteArray secret)
             if (!error.isEmpty()) {
                 // A failed write can still be used in memory, and an unchanged old key remains tracked.
                 current.account.saveSecret = previouslySaved;
+                // A temporary profile key must never be reused to open a persistent
+                // profile when its keychain deletion failed. Reload the original.
+                if (eraseStored && current.account.protocol == Protocol::Telegram)
+                    current.secret.clear();
                 if (!database_.saveAccount(current.account))
                     emit errorOccurred(current.account.id, tr("Could not reconcile account settings."));
                 emit errorOccurred(current.account.id, error);
@@ -274,7 +289,29 @@ bool AccountManager::saveAccount(Account account, QByteArray secret)
         };
         if (updateStored)
             credentials_.write(account.id, session->secret, std::move(complete));
-        else
+        else if (account.protocol == Protocol::Telegram && session->secret.isEmpty()) {
+            // Disabling persistence still needs the custom application identity
+            // for the temporary session. Read it before deleting its keychain slot.
+            credentials_.read(account.id,
+                [this, guard, complete = std::move(complete)](
+                    QByteArray saved, const QString &error) mutable {
+                    if (!guard)
+                        return;
+                    if (!error.isEmpty()) {
+                        complete(error);
+                        return;
+                    }
+                    const auto decoded = decodeTelegramCredentials(saved);
+                    const auto hash = decoded ? decoded->apiHash : saved;
+                    if (!guard->account.providerId.isEmpty() && !validTelegramApiHash(hash)) {
+                        complete(tr("Could not read the Telegram application credential."));
+                        return;
+                    }
+                    guard->secret = encodeTelegramCredentials(newTelegramCredentials(hash));
+                    saved.fill('\0');
+                    credentials_.remove(guard->account.id, std::move(complete));
+                });
+        } else
             credentials_.remove(account.id, std::move(complete));
     }
     emit accountsChanged();
@@ -327,6 +364,9 @@ void AccountManager::start(Session &session)
     setState(session, ConnectionState::Connecting);
     if (session.secretOperation)
         return;
+    if (session.account.protocol == Protocol::Telegram && session.account.providerId.isEmpty()
+        && !session.account.saveSecret && session.secret.isEmpty() && bundledTelegramCredentialsAvailable())
+        session.secret = encodeTelegramCredentials(newTelegramCredentials());
     if (!session.provider)
         createProvider(session);
     if (!session.provider) {
@@ -357,6 +397,34 @@ void AccountManager::start(Session &session)
                 return;
             }
             onFailure(*guard, error.isEmpty() ? tr("The saved password is missing.") : error, false);
+            return;
+        }
+        if (guard->account.protocol == Protocol::Telegram && validTelegramApiHash(secret)) {
+            // Persist BOTH keys before opening the legacy database. Either key can open
+            // the profile after a crash during TDLib's atomic key rotation.
+            const auto migrated
+                = encodeTelegramCredentials(migrateTelegramCredentials(secret, guard->account.id));
+            secret.fill('\0');
+            guard->secretOperation = true;
+            credentials_.write(
+                guard->account.id, migrated, [this, guard, generation, migrated](const QString &writeError) {
+                    if (!guard)
+                        return;
+                    guard->secretOperation = false;
+                    if (!guard->wanted)
+                        return;
+                    if (guard->generation != generation) {
+                        if (guard->state == ConnectionState::Connecting)
+                            start(*guard);
+                        return;
+                    }
+                    if (!writeError.isEmpty()) {
+                        onFailure(
+                            *guard, tr("Could not secure the Telegram session key. ") + writeError, false);
+                        return;
+                    }
+                    guard->provider->connectAccount(migrated);
+                });
             return;
         }
         guard->provider->connectAccount(secret);

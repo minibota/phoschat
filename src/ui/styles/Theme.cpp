@@ -30,7 +30,6 @@ namespace {
         const char *disabled;
         const char *accent;
         const char *focus;
-        const char *softFocus;
         const char *border;
         const char *raisedBorder;
         const char *button;
@@ -63,7 +62,6 @@ namespace {
         .disabled = "#869aa6",
         .accent = "#abe69c",
         .focus = "#83e5bc",
-        .softFocus = "#5c9d86",
         .border = "#2a3a47",
         .raisedBorder = "#344956",
         .button = "#1a2934",
@@ -96,7 +94,6 @@ namespace {
         .disabled = "#64776b",
         .accent = "#286547",
         .focus = "#31774f",
-        .softFocus = "#558c6d",
         .border = "#b8caba",
         .raisedBorder = "#98b5a4",
         .button = "#e9f1e6",
@@ -224,10 +221,8 @@ namespace {
         QLineEdit[role="search"] { min-height: 29px; padding-left: 4px; }
         QPlainTextEdit { padding: 5px; }
         QTreeWidget[role="conversations"], QListView[role="timeline"] {
-            border: 0; background: @window@; outline: 0;
+            border: 0; border-radius: 0; background: @window@; outline: 0;
         }
-        QTreeWidget[role="conversations"] { border: 1px solid transparent; }
-        QTreeWidget[role="conversations"]:focus { border-color: @soft-focus@; }
         QTreeWidget[role="conversations"]::item { min-height: 34px; }
         QTreeWidget[role="conversations"]::branch:selected { background: @selection@; }
         QTreeWidget[role="conversations"]::item:selected, QListView[role="timeline"]::item:selected {
@@ -240,6 +235,12 @@ namespace {
         }
         QToolButton:hover, QPushButton:hover { background: @button-hover@; }
         QToolButton:focus, QPushButton:focus { border-color: @focus@; }
+        /* QLineEdit positions its embedded action buttons. Keep the general
+           button padding/minimum height from moving their icons off-center. */
+        QLineEdit QToolButton {
+            border: none; border-radius: 0; background: transparent;
+            padding: 0; min-width: 0; min-height: 0;
+        }
         QToolButton[role="icon"] { padding: 3px; min-width: 23px; min-height: 23px; }
         QToolButton[role="icon"]::menu-indicator { image: none; width: 0; }
         QPushButton[role="primary"] {
@@ -267,7 +268,6 @@ namespace {
                  { "@muted@", colors.muted },
                  { "@disabled@", colors.disabled },
                  { "@focus@", colors.focus },
-                 { "@soft-focus@", colors.softFocus },
                  { "@border@", colors.border },
                  { "@raised-border@", colors.raisedBorder },
                  { "@button@", colors.button },
