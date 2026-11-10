@@ -31,7 +31,8 @@ git -C $tdlib fetch --depth 1 https://github.com/tdlib/td.git $env:TDLIB_REF
 git -C $tdlib checkout --detach FETCH_HEAD
 cmake -S $tdlib -B "$tdlib/build" -G Ninja -DCMAKE_BUILD_TYPE=Release `
     "-DCMAKE_TOOLCHAIN_FILE=$vcpkg/scripts/buildsystems/vcpkg.cmake" `
-    -DVCPKG_TARGET_TRIPLET=x64-windows-static -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded `
+    -DVCPKG_TARGET_TRIPLET=x64-windows-static -DCMAKE_POLICY_DEFAULT_CMP0091=NEW `
+    -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded `
     -DTD_ENABLE_LTO=OFF -DTD_INSTALL_STATIC_LIBRARIES=OFF
 cmake --build "$tdlib/build" --target tdjson --parallel 2
 

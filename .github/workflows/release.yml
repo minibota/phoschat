@@ -17,7 +17,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: phoschat-packaging-${{ github.ref }}
+  group: phoschat-packaging-${{ github.ref }}-${{ github.sha }}
   cancel-in-progress: false
 
 env:
@@ -60,7 +60,7 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends build-essential ca-certificates cmake \
-            desktop-file-utils dpkg-dev git ninja-build qt6-base-dev libqt6sql6-sqlite \
+            desktop-file-utils dpkg-dev file git ninja-build qt6-base-dev libqt6sql6-sqlite \
             qtkeychain-qt6-dev
       - uses: actions/checkout@v4
       - name: Build, test and create DEB
