@@ -3,11 +3,13 @@
 
 #include <QFile>
 #include <QHostAddress>
+#include <QNetworkProxy>
 #include <QSignalSpy>
 #include <QSslCertificate>
 #include <QSslKey>
 #include <QSslSocket>
 #include <QTcpServer>
+#include <QTcpSocket>
 #include <QtTest>
 #include <algorithm>
 
@@ -20,19 +22,31 @@ public:
     explicit IrcLoopbackServer(QSslConfiguration configuration)
         : configuration_(std::move(configuration))
     {
+        setProxy(QNetworkProxy(QNetworkProxy::NoProxy));
     }
 
     void send(const QByteArray &bytes) { peer_->write(bytes); }
 
     void hangUp() { peer_->abort(); }
 
+    QString registrationDiagnostic(const QSignalSpy &errors) const
+    {
+        const auto error = errors.isEmpty() ? acceptError_ : errors.constLast().constFirst().toString();
+        return QStringLiteral("Received %1 registration commands, accepted peer %2, error: %3")
+            .arg(commands.size())
+            .arg(peer_ ? QStringLiteral("yes") : QStringLiteral("no"))
+            .arg(error.isEmpty() ? QStringLiteral("none reported") : error);
+    }
+
     QList<QByteArray> commands;
 
 protected:
     void incomingConnection(qintptr descriptor) override
     {
-        auto *peer = new QSslSocket(this);
+        auto *tlsPeer = configuration_.isNull() ? nullptr : new QSslSocket(this);
+        auto *peer = tlsPeer ? static_cast<QTcpSocket *>(tlsPeer) : new QTcpSocket(this);
         if (!peer->setSocketDescriptor(descriptor)) {
+            acceptError_ = peer->errorString();
             peer->deleteLater();
             return;
         }
@@ -46,15 +60,16 @@ protected:
                 commands.append(line);
             }
         });
-        if (!configuration_.isNull()) {
-            peer->setSslConfiguration(configuration_);
-            peer->startServerEncryption();
+        if (tlsPeer) {
+            tlsPeer->setSslConfiguration(configuration_);
+            tlsPeer->startServerEncryption();
         }
     }
 
 private:
     QSslConfiguration configuration_;
-    QSslSocket *peer_ = nullptr;
+    QTcpSocket *peer_ = nullptr;
+    QString acceptError_;
 };
 
 QByteArray readFixture(const QString &path)
@@ -63,13 +78,14 @@ QByteArray readFixture(const QString &path)
     return file.open(QIODevice::ReadOnly) ? file.readAll() : QByteArray {};
 }
 
-Account loopbackAccount(quint16 port)
+Account loopbackAccount(quint16 port, bool tls = true)
 {
     Account account;
     account.id = QStringLiteral("test-network");
-    account.host = QStringLiteral("localhost");
+    account.host = tls ? QStringLiteral("localhost") : QStringLiteral("127.0.0.1");
     account.port = port;
     account.nick = QStringLiteral("Tester");
+    account.tls = tls;
     return account;
 }
 
@@ -85,6 +101,7 @@ class IrcTest final : public QObject {
     Q_OBJECT
 
 private slots:
+    void initTestCase();
     void parsesAndBoundsFrames();
     void foldsNamesAndStripsFormatting();
     void legacyPlaintextRegistration();
@@ -97,6 +114,8 @@ private slots:
     void rejectsPlaintextSasl();
     void reportsUnavailableSasl();
 };
+
+void IrcTest::initTestCase() { QNetworkProxy::setApplicationProxy(QNetworkProxy(QNetworkProxy::NoProxy)); }
 
 void IrcTest::parsesAndBoundsFrames()
 {
@@ -158,14 +177,14 @@ void IrcTest::legacyPlaintextRegistration()
 {
     IrcLoopbackServer server({});
     QVERIFY(server.listen(QHostAddress::LocalHost));
-    auto account = loopbackAccount(server.serverPort());
-    account.tls = false;
-    IrcProvider provider(account);
+    IrcProvider provider(loopbackAccount(server.serverPort(), false));
     QSignalSpy states(&provider, &IChatProvider::stateChanged);
     QSignalSpy errors(&provider, &IChatProvider::errorOccurred);
 
     provider.connectAccount({});
-    QTRY_COMPARE_WITH_TIMEOUT(server.commands.size(), 3, 3000);
+    QTRY_VERIFY2_WITH_TIMEOUT(server.commands.size() == 3 || !errors.isEmpty(),
+        qPrintable(server.registrationDiagnostic(errors)), 3000);
+    QVERIFY2(errors.isEmpty(), qPrintable(server.registrationDiagnostic(errors)));
     QCOMPARE(server.commands.at(0), QByteArray("CAP LS 302"));
     QCOMPARE(server.commands.at(1), QByteArray("NICK Tester"));
     server.send(":irc 421 Tester CAP :Unknown command\r\n"
@@ -186,15 +205,16 @@ void IrcTest::listsPublicChannels()
 {
     IrcLoopbackServer server({});
     QVERIFY(server.listen(QHostAddress::LocalHost));
-    auto account = loopbackAccount(server.serverPort());
-    account.tls = false;
-    IrcProvider provider(account);
+    IrcProvider provider(loopbackAccount(server.serverPort(), false));
     QSignalSpy states(&provider, &IChatProvider::stateChanged);
+    QSignalSpy errors(&provider, &IChatProvider::errorOccurred);
     QSignalSpy updates(&provider, &IrcProvider::channelListChanged);
     QVERIFY(!provider.requestChannelList().isEmpty());
 
     provider.connectAccount({});
-    QTRY_COMPARE(server.commands.size(), 3);
+    QTRY_VERIFY2_WITH_TIMEOUT(server.commands.size() == 3 || !errors.isEmpty(),
+        qPrintable(server.registrationDiagnostic(errors)), 3000);
+    QVERIFY2(errors.isEmpty(), qPrintable(server.registrationDiagnostic(errors)));
     server.send(":irc 421 Tester CAP :Unknown command\r\n"
                 ":irc 001 Tester :Welcome\r\n"
                 ":irc 422 Tester :No MOTD\r\n"
@@ -234,12 +254,13 @@ void IrcTest::boundsChannelDirectory()
 {
     IrcLoopbackServer server({});
     QVERIFY(server.listen(QHostAddress::LocalHost));
-    auto account = loopbackAccount(server.serverPort());
-    account.tls = false;
-    IrcProvider provider(account);
+    IrcProvider provider(loopbackAccount(server.serverPort(), false));
     QSignalSpy states(&provider, &IChatProvider::stateChanged);
+    QSignalSpy errors(&provider, &IChatProvider::errorOccurred);
     provider.connectAccount({});
-    QTRY_COMPARE(server.commands.size(), 3);
+    QTRY_VERIFY2_WITH_TIMEOUT(server.commands.size() == 3 || !errors.isEmpty(),
+        qPrintable(server.registrationDiagnostic(errors)), 3000);
+    QVERIFY2(errors.isEmpty(), qPrintable(server.registrationDiagnostic(errors)));
     server.send(":irc 421 Tester CAP :Unknown command\r\n"
                 ":irc 001 Tester :Welcome\r\n"
                 ":irc 422 Tester :No MOTD\r\n");
@@ -441,8 +462,7 @@ void IrcTest::rejectsInvalidCertificates()
 
 void IrcTest::rejectsPlaintextSasl()
 {
-    Account account = loopbackAccount(6667);
-    account.tls = false;
+    Account account = loopbackAccount(6667, false);
     account.saslUser = QStringLiteral("demo");
     IrcProvider provider(account);
     QSignalSpy errors(&provider, &IChatProvider::errorOccurred);
