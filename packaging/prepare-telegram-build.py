@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Validate official app credentials, optionally stage them for a Flatpak build.
+"""Validate app build settings, optionally stage them for a Flatpak build.
 
 Read values only from the environment. The private JSON is a source input copied
 into Flatpak's build sandbox; only its path appears in the generated manifest.
 Neither file belongs in release artifacts or version control.
+Public Slack app settings may be included directly in the generated manifest.
 """
 
 import argparse
@@ -35,7 +36,28 @@ def private_write(path, data):
             os.unlink(temporary)
 
 
-def prepare_flatpak(root, credentials):
+def slack_client_id_from_environment():
+    client_id = os.environ.get("PHOSCHAT_SLACK_CLIENT_ID", "")
+    if client_id and not re.fullmatch(r"[0-9]{1,32}\.[0-9]{1,32}", client_id):
+        raise ValueError("Configure a valid public SLACK_CLIENT_ID repository variable.")
+    return client_id
+
+
+def slack_oauth_origin_from_environment(client_id):
+    origin = os.environ.get("PHOSCHAT_SLACK_OAUTH_ORIGIN", "")
+    if not origin:
+        return ""
+    host = origin.removeprefix("https://")
+    labels = host.split(".")
+    label_pattern = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    if (not client_id or not origin.startswith("https://") or len(host) > 253
+            or len(labels) < 2 or not re.fullmatch(r"[A-Za-z].*", labels[-1])
+            or any(not re.fullmatch(label_pattern, label) for label in labels)):
+        raise ValueError("Configure a bare public HTTPS origin and SLACK_CLIENT_ID repository variables.")
+    return origin
+
+
+def prepare_flatpak(root, credentials, slack_client_id="", slack_oauth_origin=""):
     manifest_path = root / "packaging/flatpak/io.phoschat.desktop.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     module = next(item for item in manifest["modules"] if item.get("name") == "phoschat")
@@ -43,6 +65,11 @@ def prepare_flatpak(root, credentials):
         "-DPHOSCHAT_REQUIRE_TELEGRAM_APP_CREDENTIALS=ON",
         "-DPHOSCHAT_TELEGRAM_CREDENTIALS_FILE=.phoschat-build-credentials.json",
     ]
+    if slack_client_id:
+        # Public app identity may enter the manifest; OAuth secrets never do.
+        module["config-opts"].append("-DPHOSCHAT_SLACK_CLIENT_ID=" + slack_client_id)
+    if slack_oauth_origin:
+        module["config-opts"].append("-DPHOSCHAT_SLACK_OAUTH_ORIGIN=" + slack_oauth_origin)
     # Sources and the generated header stay in /run/build, never under /app.
     # The source-only key file is deleted once PhosChat has been installed.
     module.setdefault("post-install", []).append(
@@ -58,10 +85,13 @@ def main():
     arguments = parser.parse_args()
     try:
         credentials = credentials_from_environment()
+        slack_client_id = slack_client_id_from_environment()
+        slack_oauth_origin = slack_oauth_origin_from_environment(slack_client_id)
         if arguments.flatpak:
-            prepare_flatpak(Path(__file__).resolve().parents[1], credentials)
+            prepare_flatpak(Path(__file__).resolve().parents[1], credentials, slack_client_id,
+                            slack_oauth_origin)
     except (ValueError, OSError, KeyError, StopIteration):
-        parser.exit(1, "Official Telegram build setup failed. Check repository secrets and build inputs.\n")
+        parser.exit(1, "Official build setup failed. Check repository secrets, public app variables and build inputs.\n")
 
 
 if __name__ == "__main__":

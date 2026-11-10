@@ -38,6 +38,7 @@ private:
     AccountManager &m_accounts;
     QString m_savingAccountId;
     bool m_telegramDefaultsApplied {};
+    bool m_slackDefaultsApplied {};
     QComboBox *m_account {};
     QComboBox *m_protocol {};
     QComboBox *m_ircPreset {};
@@ -54,6 +55,7 @@ private:
     QLineEdit *m_providerId {};
     QLineEdit *m_cloudSecret {};
     QCheckBox *m_customTelegramApplication {};
+    QCheckBox *m_customSlackApplication {};
     QCheckBox *m_remember {};
     QCheckBox *m_autoConnect {};
     QLabel *m_networkHint {};

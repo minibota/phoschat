@@ -77,6 +77,8 @@ private slots:
     void searchAndRefreshKeepTheOpenAccount();
     void accountSummaryTracksAllStates();
     void emptyAccountsAndSearchKeepGuidance();
+    void incomingUnreadMessagesMoveToTopAndReturnWhenRead();
+    void recentSectionsKeepTheirOrderWithOlderUnreadMessages();
 
 private:
     QTemporaryDir settingsDirectory_;
@@ -301,6 +303,139 @@ void AccountOverviewTest::emptyAccountsAndSearchKeepGuidance()
     QVERIFY(search->text().isEmpty());
     QVERIFY(header(main, u"account/empty"_s)->isChecked());
     QVERIFY(visibleText(u"No conversations yet"_s));
+}
+
+void AccountOverviewTest::incomingUnreadMessagesMoveToTopAndReturnWhenRead()
+{
+    Database database(u":memory:"_s);
+    QVERIFY(database.open());
+    Account account;
+    account.id = u"unread-account"_s;
+    account.label = u"Unread test"_s;
+    account.host = u"irc.example.test"_s;
+    account.nick = u"Preview"_s;
+    QVERIFY(database.saveAccount(account));
+    for (const auto &name :
+        { u"Alpha"_s, u"Beta"_s, u"History"_s, u"Outgoing"_s, u"Zulu"_s, u"Favorite A"_s, u"Favorite Z"_s }) {
+        Conversation conversation;
+        conversation.id = { account.id, name };
+        conversation.title = name;
+        conversation.favorite = name.startsWith(u"Favorite");
+        QVERIFY(database.saveConversation(conversation));
+    }
+    CredentialStore credentials;
+    AccountManager accounts(database, credentials, nullptr,
+        [](const Account &, QObject *parent) { return new PreviewProvider(parent); });
+    ConversationManager conversations(accounts, database);
+    MessageManager messages(accounts, conversations, database);
+    WindowManager windows(accounts, conversations, messages);
+    MainWindow main(accounts, conversations, windows);
+    main.show();
+    accounts.connectAccount(account.id);
+    auto *provider = accounts.provider(account.id);
+    QVERIFY(provider);
+    auto *tree = main.findChild<QTreeWidget *>();
+    QVERIFY(tree);
+    const auto section = [tree](const QString &key) -> QTreeWidgetItem * {
+        for (int index = 0; index < tree->topLevelItemCount(); ++index) {
+            auto *item = tree->topLevelItem(index);
+            if (item->data(0, Qt::UserRole + 3).toString() == key)
+                return item;
+        }
+        return nullptr;
+    };
+    const auto children = [&section](const QString &key) {
+        QStringList ids;
+        if (const auto *group = section(key)) {
+            for (int index = 0; index < group->childCount(); ++index)
+                ids.append(group->child(index)->data(0, Qt::UserRole + 2).toString());
+        }
+        return ids;
+    };
+    const auto accountKey = u"account/"_s + account.id;
+    QVERIFY(section(accountKey));
+    QTest::mouseClick(header(main, accountKey), Qt::LeftButton);
+    tree->setCurrentItem(section(accountKey)->child(0));
+    QCOMPARE(tree->currentItem()->text(0), u"Alpha"_s);
+    const auto now = QDateTime::currentDateTimeUtc();
+    const Message older { { account.id, u"Beta"_s }, u"older"_s, u"Peer"_s, u"Earlier unread"_s,
+        now.addSecs(-10) };
+    const Message newest { { account.id, u"Zulu"_s }, u"newest"_s, u"Peer"_s, u"Latest unread"_s, now };
+    provider->messageReceived(older);
+    provider->messageReceived(newest);
+    QTRY_COMPARE(children(accountKey),
+        (QStringList { u"Zulu"_s, u"Beta"_s, u"Alpha"_s, u"History"_s, u"Outgoing"_s }));
+    QVERIFY(section(accountKey)->child(0)->font(0).bold());
+    QCOMPARE(section(accountKey)->child(0)->text(2), u"1"_s);
+    QCOMPARE(tree->currentItem()->text(0), u"Alpha"_s);
+    QVERIFY(header(main, accountKey)->isChecked());
+
+    // Replays, fetched history and our own sends do not create new unread chats.
+    provider->messageReceived(newest);
+    provider->messageReceived(Message { { account.id, u"History"_s }, u"history"_s, u"Peer"_s,
+        u"Fetched history"_s, now.addSecs(10), false, false, true });
+    provider->messageReceived(Message { { account.id, u"Outgoing"_s }, u"outgoing"_s, u"Preview"_s,
+        u"Our own message"_s, now.addSecs(20), true });
+    QCOMPARE(conversations.conversation(newest.conversation)->unread, 1);
+    QCOMPARE(conversations.conversation({ account.id, u"History"_s })->unread, 0);
+    QCOMPARE(conversations.conversation({ account.id, u"Outgoing"_s })->unread, 0);
+    conversations.markRead(newest.conversation);
+    QTRY_COMPARE(children(accountKey),
+        (QStringList { u"Beta"_s, u"Alpha"_s, u"History"_s, u"Outgoing"_s, u"Zulu"_s }));
+    QCOMPARE(section(accountKey)->child(4)->text(2), QString {});
+    QVERIFY(!section(accountKey)->child(4)->font(0).bold());
+
+    provider->messageReceived(Message {
+        { account.id, u"Favorite Z"_s }, u"favorite"_s, u"Peer"_s, u"Favorite unread"_s, now.addSecs(-20) });
+    QTRY_COMPARE(children(u"favorites"_s), (QStringList { u"Favorite Z"_s, u"Favorite A"_s }));
+    QCOMPARE(tree->topLevelItem(0)->data(0, Qt::UserRole + 3).toString(), u"favorites"_s);
+    QVERIFY(header(main, accountKey)->isChecked());
+    conversations.markRead(older.conversation);
+    QTRY_COMPARE(children(accountKey),
+        (QStringList { u"Alpha"_s, u"Beta"_s, u"History"_s, u"Outgoing"_s, u"Zulu"_s }));
+}
+
+void AccountOverviewTest::recentSectionsKeepTheirOrderWithOlderUnreadMessages()
+{
+    QSettings().setValue(u"ui/grouping"_s, 3);
+    Database database(u":memory:"_s);
+    QVERIFY(database.open());
+    Account account;
+    account.id = u"recent-account"_s;
+    account.label = u"Recent test"_s;
+    QVERIFY(database.saveAccount(account));
+    const auto now = QDateTime::currentDateTimeUtc();
+    const auto addConversation
+        = [&database, &account](const QString &id, const QDateTime &updated, int unread = 0) {
+              Conversation conversation;
+              conversation.id = { account.id, id };
+              conversation.title = id;
+              conversation.kind = ConversationKind::Direct;
+              conversation.updated = updated;
+              conversation.unread = unread;
+              QVERIFY(database.saveConversation(conversation));
+          };
+    addConversation(u"today"_s, now);
+    addConversation(u"recent-read"_s, now.addDays(-2));
+    addConversation(u"unread"_s, now.addDays(-3), 1);
+    addConversation(u"old-read"_s, now.addDays(-4));
+    addConversation(u"none"_s, {});
+    CredentialStore credentials;
+    AccountManager accounts(database, credentials);
+    ConversationManager conversations(accounts, database);
+    MessageManager messages(accounts, conversations, database);
+    WindowManager windows(accounts, conversations, messages);
+    MainWindow main(accounts, conversations, windows);
+    auto *tree = main.findChild<QTreeWidget *>();
+    QVERIFY(tree);
+    QCOMPARE(tree->topLevelItemCount(), 3);
+    QCOMPARE(tree->topLevelItem(0)->data(0, Qt::UserRole + 3).toString(), u"recent/today"_s);
+    QCOMPARE(tree->topLevelItem(1)->data(0, Qt::UserRole + 3).toString(), u"recent/earlier"_s);
+    QCOMPARE(tree->topLevelItem(2)->data(0, Qt::UserRole + 3).toString(), u"recent/none"_s);
+    auto *earlier = tree->topLevelItem(1);
+    QCOMPARE(earlier->child(0)->data(0, Qt::UserRole + 2).toString(), u"unread"_s);
+    QCOMPARE(earlier->child(1)->data(0, Qt::UserRole + 2).toString(), u"recent-read"_s);
+    QCOMPARE(earlier->child(2)->data(0, Qt::UserRole + 2).toString(), u"old-read"_s);
 }
 
 QTEST_MAIN(AccountOverviewTest)

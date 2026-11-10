@@ -66,9 +66,12 @@ namespace {
             painter->drawRoundedRect(bubble, 9, 9);
 
             const auto timestamp = index.data(MessageModel::TimeRole).toDateTime().toLocalTime();
-            const auto time = timestamp.date() == QDate::currentDate()
+            auto time = timestamp.date() == QDate::currentDate()
                 ? timestamp.toString(QStringLiteral("HH:mm"))
                 : timestamp.toString(QStringLiteral("dd MMM · HH:mm"));
+            const auto delivery = index.data(MessageModel::DeliveryRole).toString();
+            if (!delivery.isEmpty())
+                time += QStringLiteral(" · ") + delivery;
             auto metadata = option.font;
             metadata.setPointSizeF(std::max(8.0, metadata.pointSizeF() - 0.8));
             painter->setFont(metadata);
@@ -130,13 +133,27 @@ MessageView::MessageView(MessageModel &model, QWidget *parent)
     setAccessibleName(tr("Message history"));
     setContextMenuPolicy(Qt::CustomContextMenu);
 
-    connect(&model, &MessageModel::rowsAboutToBeInserted, this,
-        [this] { m_wasAtBottom = verticalScrollBar()->maximum() - verticalScrollBar()->value() < 20; });
-    connect(&model, &MessageModel::rowsInserted, this, [this, &model](const QModelIndex &, int, int last) {
-        if (m_wasAtBottom || model.index(last).data(MessageModel::OutgoingRole).toBool()) {
-            showLatest();
+    connect(&model, &MessageModel::rowsAboutToBeInserted, this, [this] {
+        if (!m_adjustmentPending) {
+            m_wasAtBottom = verticalScrollBar()->maximum() - verticalScrollBar()->value() < 20;
+            m_scrollAnchor = indexAt(QPoint(viewport()->width() / 2, 0));
+            m_anchorTop = m_scrollAnchor.isValid() ? visualRect(m_scrollAnchor).top() : 0;
         }
     });
+    connect(
+        &model, &MessageModel::rowsInserted, this, [this, &model](const QModelIndex &, int first, int last) {
+            const auto message = model.index(last);
+            const bool historical = message.data(MessageModel::HistoricalRole).toBool();
+            const bool insertedBeforeExisting = first < model.rowCount() - (last - first + 1);
+            if (historical && insertedBeforeExisting && m_scrollAnchor.isValid()) {
+                // Keep the same visible message, including its partial-row offset,
+                // when an older page arrives. Historical outgoing messages are not sends.
+                m_followLatest = false;
+            } else if (m_wasAtBottom || (!historical && message.data(MessageModel::OutgoingRole).toBool())) {
+                m_followLatest = true;
+            }
+            scheduleScrollAdjustment();
+        });
     connect(this, &MessageView::customContextMenuRequested, this, [this](const QPoint &pos) {
         const auto index = indexAt(pos);
         if (!index.isValid()) {
@@ -154,7 +171,27 @@ MessageView::MessageView(MessageModel &model, QWidget *parent)
 
 void MessageView::showLatest()
 {
-    QTimer::singleShot(0, this, [this] { scrollToBottom(); });
+    m_followLatest = true;
+    scheduleScrollAdjustment();
+}
+
+void MessageView::scheduleScrollAdjustment()
+{
+    if (m_adjustmentPending)
+        return;
+    m_adjustmentPending = true;
+    QTimer::singleShot(0, this, [this] {
+        doItemsLayout();
+        if (m_followLatest) {
+            scrollToBottom();
+        } else if (m_scrollAnchor.isValid()) {
+            scrollTo(m_scrollAnchor, QAbstractItemView::PositionAtTop);
+            verticalScrollBar()->setValue(verticalScrollBar()->value() - m_anchorTop);
+        }
+        m_scrollAnchor = QPersistentModelIndex {};
+        m_adjustmentPending = false;
+        m_followLatest = false;
+    });
 }
 
 bool MessageView::viewportEvent(QEvent *event)

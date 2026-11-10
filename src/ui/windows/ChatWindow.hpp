@@ -8,6 +8,7 @@ class QLabel;
 class QLineEdit;
 class QListWidget;
 class QPushButton;
+class QToolButton;
 
 namespace phoschat::ui {
 
@@ -26,6 +27,7 @@ public:
 
 signals:
     void activated();
+    void profileRequested();
     void closing(const QByteArray &geometry);
 
 protected:
@@ -34,19 +36,26 @@ protected:
 
 private:
     void send();
+    void attach();
     void refreshComposer();
+    void refreshHistory();
+    void refreshPresence(Presence presence);
 
     ConversationController &m_controller;
     MessageView *m_timeline {};
-    QLabel *m_title {};
+    QToolButton *m_title {};
+    QToolButton *m_avatar {};
     QLabel *m_subtitle {};
-    QLabel *m_status {};
+    QLabel *m_presenceDot {};
     QLabel *m_composerHint {};
     QLineEdit *m_composer {};
     QPushButton *m_send {};
+    QPushButton *m_attach {};
+    QPushButton *m_historyButton {};
     QPushButton *m_membersButton {};
     QListWidget *m_members {};
     ConnectionState m_state { ConnectionState::Disconnected };
+    Presence m_presence { Presence::Unknown };
     Protocol m_protocol { Protocol::Irc };
 };
 

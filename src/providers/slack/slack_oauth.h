@@ -12,7 +12,8 @@ class SlackOAuth final : public QObject {
 
 public:
     explicit SlackOAuth(QObject *parent = nullptr);
-    bool start(const QString &clientId, quint16 port, const QUrl &authorizationEndpoint);
+    bool start(const QString &clientId, quint16 port, const QUrl &authorizationEndpoint,
+        const QUrl &callbackOrigin = {});
     void stop();
 
 signals:

@@ -10,7 +10,7 @@ namespace {
 
     constexpr auto CallbackPath = "/phoschat/slack/callback";
     constexpr auto UserScopes = "channels:read,channels:history,groups:read,groups:history,"
-                                "im:read,im:history,mpim:read,mpim:history,chat:write,users:read";
+                                "im:read,im:history,mpim:read,mpim:history,chat:write,users:read,files:write";
 
     QString randomUrlKey()
     {
@@ -45,7 +45,8 @@ SlackOAuth::SlackOAuth(QObject *parent)
     });
 }
 
-bool SlackOAuth::start(const QString &clientId, quint16 port, const QUrl &authorizationEndpoint)
+bool SlackOAuth::start(
+    const QString &clientId, quint16 port, const QUrl &authorizationEndpoint, const QUrl &callbackOrigin)
 {
     stop();
     if (!server_.listen(QHostAddress::LocalHost, port))
@@ -54,6 +55,8 @@ bool SlackOAuth::start(const QString &clientId, quint16 port, const QUrl &author
     redirect_ = QUrl(QStringLiteral("http://localhost:%1%2")
             .arg(server_.serverPort())
             .arg(QString::fromLatin1(CallbackPath)));
+    if (!callbackOrigin.isEmpty())
+        redirect_ = callbackOrigin.resolved(QUrl(QString::fromLatin1(CallbackPath)));
     state_ = randomUrlKey();
     verifier_ = randomUrlKey();
     const auto challenge = QCryptographicHash::hash(verifier_.toLatin1(), QCryptographicHash::Sha256)

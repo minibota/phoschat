@@ -6,16 +6,22 @@
 #include "ui/styles/Theme.hpp"
 
 #include <QCloseEvent>
+#include <QFileDialog>
 #include <QFrame>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
 #include <QPushButton>
-#include <QStyle>
+#include <QToolButton>
 #include <QVBoxLayout>
 
 namespace phoschat::ui {
+namespace {
+
+    constexpr int kAvatarSize = 32;
+
+} // namespace
 
 ChatWindow::ChatWindow(ConversationController &controller)
     : m_controller(controller)
@@ -30,26 +36,43 @@ ChatWindow::ChatWindow(ConversationController &controller)
     content->setSpacing(10);
 
     auto *header = new QHBoxLayout;
-    header->setSpacing(11);
+    header->setSpacing(9);
+    m_avatar = new QToolButton;
+    m_avatar->setObjectName(QStringLiteral("contactProfilePhoto"));
+    m_avatar->setProperty("role", QStringLiteral("chatProfile"));
+    m_avatar->setFixedSize(kAvatarSize + 2, kAvatarSize + 2);
+    m_avatar->setIconSize(QSize(kAvatarSize, kAvatarSize));
+    m_avatar->setCursor(Qt::PointingHandCursor);
+    m_avatar->hide();
+    header->addWidget(m_avatar, 0, Qt::AlignVCenter);
     auto *titleBlock = new QVBoxLayout;
     titleBlock->setSpacing(1);
-    m_title = new QLabel;
-    m_title->setProperty("role", QStringLiteral("heading"));
-    m_title->setTextFormat(Qt::PlainText);
-    m_title->setMinimumWidth(0);
-    m_title->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+    auto *titleRow = new QHBoxLayout;
+    titleRow->setSpacing(6);
+    m_title = new QToolButton;
+    m_title->setObjectName(QStringLiteral("contactProfileName"));
+    m_title->setProperty("role", QStringLiteral("chatProfileTitle"));
+    m_title->setToolButtonStyle(Qt::ToolButtonTextOnly);
+    m_title->setMinimumWidth(1);
+    m_title->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
+    m_title->setCursor(Qt::PointingHandCursor);
+    titleRow->addWidget(m_title);
+    m_presenceDot = new QLabel;
+    m_presenceDot->setObjectName(QStringLiteral("contactPresenceIndicator"));
+    m_presenceDot->setFixedSize(8, 8);
+    m_presenceDot->hide();
+    titleRow->addWidget(m_presenceDot, 0, Qt::AlignVCenter);
+    titleRow->addStretch(1);
+    connect(m_avatar, &QToolButton::clicked, this, &ChatWindow::profileRequested);
+    connect(m_title, &QToolButton::clicked, this, &ChatWindow::profileRequested);
     m_subtitle = new QLabel;
     m_subtitle->setProperty("role", QStringLiteral("muted"));
     m_subtitle->setTextFormat(Qt::PlainText);
     m_subtitle->setMinimumWidth(0);
     m_subtitle->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
-    titleBlock->addWidget(m_title);
+    titleBlock->addLayout(titleRow);
     titleBlock->addWidget(m_subtitle);
     header->addLayout(titleBlock, 1);
-    m_status = new QLabel;
-    m_status->setProperty("role", QStringLiteral("badge"));
-    m_status->setTextFormat(Qt::PlainText);
-    header->addWidget(m_status, 0, Qt::AlignTop);
     m_membersButton = new QPushButton(tr("People"));
     m_membersButton->setCheckable(true);
     m_membersButton->setToolTip(tr("Show the current channel member list"));
@@ -60,6 +83,14 @@ ChatWindow::ChatWindow(ConversationController &controller)
     divider->setProperty("role", QStringLiteral("rule"));
     divider->setFixedHeight(1);
     content->addWidget(divider);
+
+    m_historyButton = new QPushButton;
+    m_historyButton->setObjectName(QStringLiteral("loadOlderMessages"));
+    m_historyButton->setToolTip(tr("Load the next page of earlier messages in this conversation"));
+    content->addWidget(m_historyButton);
+    connect(m_historyButton, &QPushButton::clicked, this, [this] { m_controller.requestOlderHistory(); });
+    connect(&m_controller, &ConversationController::historyStateChanged, this, &ChatWindow::refreshHistory);
+    refreshHistory();
 
     auto *body = new QHBoxLayout;
     m_timeline = new MessageView(m_controller.model());
@@ -74,6 +105,9 @@ ChatWindow::ChatWindow(ConversationController &controller)
     content->addLayout(body, 1);
 
     auto *composer = new QHBoxLayout;
+    m_attach = new QPushButton(tr("Attach…"));
+    m_attach->setAccessibleName(tr("Send an attachment"));
+    composer->addWidget(m_attach);
     m_composer = new QLineEdit(m_controller.draft());
     m_composer->setAccessibleName(tr("Message"));
     m_composer->setMaxLength(4096);
@@ -93,6 +127,7 @@ ChatWindow::ChatWindow(ConversationController &controller)
     });
     connect(m_composer, &QLineEdit::returnPressed, this, &ChatWindow::send);
     connect(m_send, &QPushButton::clicked, this, &ChatWindow::send);
+    connect(m_attach, &QPushButton::clicked, this, &ChatWindow::attach);
     refreshComposer();
     m_timeline->showLatest();
 }
@@ -101,20 +136,28 @@ void ChatWindow::refresh(const Conversation &conversation, const QString &accoun
     const QString &statusDetail, Protocol protocol)
 {
     setWindowTitle(tr("%1 · PhosChat").arg(conversation.title));
-    m_title->setText(conversation.title);
-    m_title->setToolTip(conversation.title.toHtmlEscaped());
+    // Tool buttons use ampersands as mnemonics, including in remote names.
+    QString title = conversation.title;
+    m_title->setText(title.replace(QLatin1Char('&'), QStringLiteral("&&")));
+    const auto profileLabel = tr("View profile for %1").arg(conversation.title);
+    m_title->setToolTip(profileLabel.toHtmlEscaped());
+    m_title->setAccessibleName(profileLabel);
+    m_avatar->setVisible(protocol == Protocol::Telegram);
+    if (protocol == Protocol::Telegram) {
+        const auto photo = photoAvatar(conversation.avatar, kAvatarSize, devicePixelRatioF());
+        m_avatar->setIcon(
+            photo.isNull() ? conversationIcon(conversation.kind != ConversationKind::Direct) : QIcon(photo));
+        m_avatar->setToolTip(profileLabel.toHtmlEscaped());
+        m_avatar->setAccessibleName(profileLabel);
+    }
     const auto type = conversation.kind == ConversationKind::Channel ? tr("Channel")
         : conversation.kind == ConversationKind::Group               ? tr("Group")
                                                                      : tr("Direct message");
     m_subtitle->setText(tr("%1 · %2 · %3").arg(accountName, protocolLabel(protocol), type));
-    m_status->setText(connectionLabel(state));
-    const bool connected = state == ConnectionState::Connected;
-    if (m_status->property("connected").isNull() || m_status->property("connected").toBool() != connected) {
-        m_status->setProperty("connected", connected);
-        m_status->style()->unpolish(m_status);
-        m_status->style()->polish(m_status);
-    }
-    m_status->setToolTip(statusDetail.toHtmlEscaped());
+    m_subtitle->setToolTip(statusDetail.toHtmlEscaped());
+    refreshPresence(conversation.kind == ConversationKind::Direct && state == ConnectionState::Connected
+            ? conversation.presence
+            : Presence::Unknown);
     m_state = state;
     m_protocol = protocol;
     const bool channel = protocol == Protocol::Irc && conversation.kind == ConversationKind::Channel;
@@ -123,6 +166,37 @@ void ChatWindow::refresh(const Conversation &conversation, const QString &accoun
         m_membersButton->setChecked(false);
     }
     refreshComposer();
+    refreshHistory();
+}
+
+void ChatWindow::refreshPresence(Presence presence)
+{
+    if (presence == m_presence)
+        return;
+    m_presence = presence;
+    QString color;
+    QString description;
+    switch (presence) {
+    case Presence::Online:
+        color = QStringLiteral("#43a76b");
+        description = tr("Contact is online");
+        break;
+    case Presence::Away:
+        color = QStringLiteral("#d69b31");
+        description = tr("Contact is away");
+        break;
+    case Presence::Offline:
+        color = QStringLiteral("#e26368");
+        description = tr("Contact is offline");
+        break;
+    case Presence::Unknown:
+        break;
+    }
+    if (!color.isEmpty())
+        m_presenceDot->setStyleSheet(QStringLiteral("background: %1; border-radius: 4px;").arg(color));
+    m_presenceDot->setAccessibleName(description);
+    m_presenceDot->setToolTip(description);
+    m_presenceDot->setVisible(!color.isEmpty());
 }
 
 void ChatWindow::setMembers(const QStringList &members)
@@ -165,6 +239,7 @@ void ChatWindow::refreshComposer()
 {
     const bool online = m_state == ConnectionState::Connected;
     const bool available = m_controller.canSend();
+    m_attach->setVisible(m_controller.canSendFiles());
     const auto text = m_composer->text();
     const bool irc = m_protocol == Protocol::Irc;
     const bool command = irc && text.startsWith(QLatin1Char('/')) && !text.startsWith(QStringLiteral("//"));
@@ -178,6 +253,40 @@ void ChatWindow::refreshComposer()
         m_composerHint->setText(tr("Sending is unavailable in this conversation."));
     } else {
         m_composerHint->setText(tr("You can send once the account is connected."));
+    }
+}
+
+void ChatWindow::attach()
+{
+    if (!m_controller.canSendFiles())
+        return;
+    auto *dialog = new QFileDialog(this, tr("Send attachment"));
+    dialog->setAttribute(Qt::WA_DeleteOnClose);
+    dialog->setFileMode(QFileDialog::ExistingFile);
+    dialog->setLabelText(QFileDialog::Accept, tr("Send"));
+    connect(dialog, &QFileDialog::fileSelected, this, [this](const QString &path) {
+        if (!m_controller.sendFile(path))
+            m_composerHint->setText(tr("The attachment could not be sent."));
+    });
+    dialog->open();
+}
+
+void ChatWindow::refreshHistory()
+{
+    m_historyButton->setVisible(m_controller.hasPagedHistory());
+    const auto history = m_controller.historyState();
+    const bool online = m_state == ConnectionState::Connected;
+    m_historyButton->setEnabled(online && history == HistoryState::Ready);
+    if (!online) {
+        m_historyButton->setText(tr("Connect to load earlier messages"));
+    } else if (history == HistoryState::Loading) {
+        m_historyButton->setText(tr("Loading messages…"));
+    } else if (history == HistoryState::Complete) {
+        m_historyButton->setText(tr("Beginning of conversation"));
+    } else if (history == HistoryState::Ready) {
+        m_historyButton->setText(tr("Load older messages"));
+    } else {
+        m_historyButton->setText(tr("Message history is unavailable"));
     }
 }
 

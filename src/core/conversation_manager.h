@@ -4,7 +4,6 @@
 
 #include <QHash>
 #include <QObject>
-#include <QSet>
 
 #include <optional>
 
@@ -32,6 +31,8 @@ public:
 
 signals:
     void conversationsChanged();
+    void channelJoinStarted(const QString &channel);
+    void channelJoined(const phoschat::ConversationId &id);
     void membersChanged(const phoschat::ConversationId &id);
     void errorOccurred(const QString &message);
 
@@ -47,7 +48,8 @@ private:
     Database &database_;
     QHash<ConversationId, Conversation> conversations_;
     QHash<ConversationId, QStringList> members_;
-    QSet<ConversationId> pendingJoins_;
+    QHash<ConversationId, quint64> pendingJoins_;
+    quint64 nextJoinAttempt_ {};
 };
 
 } // namespace phoschat

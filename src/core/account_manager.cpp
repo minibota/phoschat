@@ -131,6 +131,13 @@ IChatProvider *AccountManager::provider(const QString &id) const
     return session ? session->provider : nullptr;
 }
 
+bool AccountManager::requestProfile(const ConversationId &id)
+{
+    if (auto *adapter = provider(id.accountId); adapter && state(id.accountId) == ConnectionState::Connected)
+        return adapter->requestProfile(id);
+    return false;
+}
+
 bool AccountManager::persistentSecretsAvailable() const { return credentials_.persistentAvailable(); }
 
 bool AccountManager::saveAccount(Account account, QByteArray secret)
@@ -451,9 +458,15 @@ void AccountManager::createProvider(Session &session)
     connect(provider, &IChatProvider::notice, &session,
         [this, &session](const QString &message) { emit errorOccurred(session.account.id, message); });
     connect(provider, &IChatProvider::conversationChanged, this, &AccountManager::conversationChanged);
+    connect(provider, &IChatProvider::profileReceived, this, &AccountManager::profileReceived);
+    connect(provider, &IChatProvider::joinFailed, this, &AccountManager::joinFailed);
     connect(provider, &IChatProvider::messageReceived, this, &AccountManager::messageReceived);
     connect(provider, &IChatProvider::messageRemoved, this, &AccountManager::messageRemoved);
+    connect(provider, &IChatProvider::messagesReadThrough, this, &AccountManager::messagesReadThrough);
+    connect(provider, &IChatProvider::historyStateChanged, this, &AccountManager::historyStateChanged);
+    connect(provider, &IChatProvider::historyCleared, this, &AccountManager::historyCleared);
     connect(provider, &IChatProvider::membersChanged, this, &AccountManager::membersChanged);
+    connect(provider, &IChatProvider::presenceChanged, this, &AccountManager::presenceChanged);
     connect(provider, &IChatProvider::authenticationRequired, &session,
         [this, &session](AuthenticationKind kind, const QString &detail) {
             emit authenticationRequired(session.account.id, kind, detail);

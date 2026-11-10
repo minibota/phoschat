@@ -5,6 +5,7 @@
 #include "security/telegram_app_credentials.h"
 #include "storage/database.h"
 #include "ui/contacts/MainWindow.hpp"
+#include "ui/conversations/ConversationController.hpp"
 #include "ui/settings/AccountDialog.hpp"
 #include "ui/styles/Theme.hpp"
 #include "ui/windows/ChatWindow.hpp"
@@ -12,8 +13,11 @@
 
 #include <QAction>
 #include <QApplication>
+#include <QBuffer>
 #include <QCheckBox>
 #include <QComboBox>
+#include <QImage>
+#include <QLabel>
 #include <QLineEdit>
 #include <QListView>
 #include <QPushButton>
@@ -55,6 +59,7 @@ private slots:
     void searchAndConversationFocusChrome();
     void telegramOnboardingUsesBuildCredentials();
     void existingTelegramApplicationIdentityIsPreserved();
+    void chatHeaderShowsClickableAvatarAndContactPresence();
 
 private:
     QTemporaryDir settingsDirectory_;
@@ -238,14 +243,18 @@ void UiTest::searchAndConversationFocusChrome()
     MainWindow main(accounts, conversations, windows);
     main.show();
     auto *search = main.findChild<QLineEdit *>();
+    auto *searchButton = main.findChild<QToolButton *>(u"conversationSearchButton"_s);
     auto *tree = main.findChild<QTreeWidget *>();
-    QVERIFY(search && tree);
+    QVERIFY(search && searchButton && tree);
+    QVERIFY(!search->isVisible());
+    QTest::mouseClick(searchButton, Qt::LeftButton);
+    QTRY_VERIFY(search->isVisible());
     search->setText(u"Phos"_s);
     QTRY_COMPARE(tree->topLevelItemCount(), 1);
     QCOMPARE(tree->topLevelItem(0)->childCount(), 1);
 
     const auto buttons = search->findChildren<QToolButton *>();
-    QCOMPARE(buttons.size(), 2); // The leading magnifier and trailing clear action.
+    QCOMPARE(buttons.size(), 1); // The magnifier is next to the new-conversation button.
     for (const auto *button : buttons) {
         QTRY_VERIFY(button->isVisible());
         QVERIFY(search->rect().contains(button->geometry()));
@@ -262,6 +271,10 @@ void UiTest::searchAndConversationFocusChrome()
     QTRY_VERIFY(search->hasFocus());
     QCOMPARE(tree->frameWidth(), 0);
     QVERIFY(item->isSelected());
+    QTest::keyClick(search, Qt::Key_Escape);
+    QTRY_VERIFY(!search->isVisible());
+    QVERIFY(search->text().isEmpty());
+    QVERIFY(!searchButton->isChecked());
     applyTheme(*qApp, Theme::Dark);
 }
 
@@ -339,6 +352,72 @@ void UiTest::existingTelegramApplicationIdentityIsPreserved()
     QVERIFY(custom->isChecked());
     QVERIFY(custom->isHidden());
     QVERIFY(!remember->isChecked());
+}
+
+void UiTest::chatHeaderShowsClickableAvatarAndContactPresence()
+{
+    Database database(u":memory:"_s);
+    QVERIFY(database.open());
+    CredentialStore credentials;
+    AccountManager accounts(database, credentials);
+    ConversationManager conversations(accounts, database);
+    MessageManager messages(accounts, conversations, database);
+    Conversation value;
+    value.id = { u"telegram"_s, u"42/7"_s };
+    value.title = u"Contact & Co"_s;
+    value.kind = ConversationKind::Direct;
+    QImage image(24, 24, QImage::Format_RGB32);
+    image.fill(QColor(Qt::red));
+    QBuffer jpeg(&value.avatar);
+    QVERIFY(jpeg.open(QIODevice::WriteOnly));
+    QVERIFY(image.save(&jpeg, "JPEG"));
+    const auto rendered = photoAvatar(value.avatar, 32, 2.0);
+    QCOMPARE(rendered.size(), QSize(64, 64));
+    QCOMPARE(rendered.devicePixelRatio(), 2.0);
+    const auto circular = rendered.toImage();
+    QCOMPARE(circular.pixelColor(0, 0).alpha(), 0);
+    QCOMPARE(circular.pixelColor(32, 32).alpha(), 255);
+    QVERIFY(circular.pixelColor(32, 32).red() > 220);
+
+    ConversationController controller(value.id, messages);
+    ChatWindow window(controller);
+    window.refresh(value, u"My account"_s, ConnectionState::Connected, {}, Protocol::Telegram);
+    window.show();
+    auto *photo = window.findChild<QToolButton *>(u"contactProfilePhoto"_s);
+    auto *name = window.findChild<QToolButton *>(u"contactProfileName"_s);
+    auto *status = window.findChild<QLabel *>(u"contactPresenceIndicator"_s);
+    QVERIFY(photo && name && status);
+    QVERIFY(photo->isVisible() && !photo->icon().isNull());
+    QCOMPARE(name->text(), u"Contact && Co"_s);
+    QVERIFY(status->text().isEmpty());
+    QVERIFY(status->isHidden());
+    QSignalSpy opened(&window, &ChatWindow::profileRequested);
+    name->click();
+    photo->click();
+    QCOMPARE(opened.size(), 2);
+
+    value.presence = Presence::Online;
+    window.refresh(value, u"My account"_s, ConnectionState::Connected, {}, Protocol::Telegram);
+    QVERIFY(status->isVisible());
+    QCOMPARE(status->accessibleName(), u"Contact is online"_s);
+    const auto green = status->styleSheet();
+    value.presence = Presence::Away;
+    window.refresh(value, u"My account"_s, ConnectionState::Connected, {}, Protocol::Telegram);
+    QCOMPARE(status->accessibleName(), u"Contact is away"_s);
+    const auto yellow = status->styleSheet();
+    QVERIFY(green != yellow);
+    value.presence = Presence::Offline;
+    window.refresh(value, u"My account"_s, ConnectionState::Connected, {}, Protocol::Telegram);
+    QCOMPARE(status->accessibleName(), u"Contact is offline"_s);
+    QVERIFY(status->styleSheet() != green && status->styleSheet() != yellow);
+
+    window.refresh(value, u"My account"_s, ConnectionState::Reconnecting, {}, Protocol::Telegram);
+    QVERIFY(status->isHidden());
+    QVERIFY(status->accessibleName().isEmpty());
+    value.kind = ConversationKind::Group;
+    value.presence = Presence::Online;
+    window.refresh(value, u"My account"_s, ConnectionState::Connected, {}, Protocol::Telegram);
+    QVERIFY(status->isHidden());
 }
 
 QTEST_MAIN(UiTest)

@@ -2,11 +2,13 @@
 
 #include "models/types.h"
 
+#include <QHash>
 #include <QIcon>
 #include <QObject>
 #include <QPointer>
 #include <QSystemTrayIcon>
 
+#include <memory>
 #include <optional>
 
 class QMenu;
@@ -15,6 +17,7 @@ namespace phoschat {
 
 class ConversationManager;
 class MessageManager;
+class LinuxNotifier;
 namespace ui {
     class MainWindow;
     class WindowManager;
@@ -37,6 +40,10 @@ private:
     QPointer<QMenu> menu_;
     QIcon icon_;
     std::optional<ConversationId> lastNotification_;
+#ifdef Q_OS_LINUX
+    std::unique_ptr<LinuxNotifier> native_;
+    QHash<QString, ConversationId> notificationConversations_;
+#endif
 };
 
 } // namespace phoschat

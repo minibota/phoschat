@@ -24,6 +24,9 @@ env:
   TDLIB_REF: c8828d50f5eac2fc7089ce1089d7ce9095c61b5e
   QT_VERSION: '6.8.3'
   QTKEYCHAIN_TAG: '0.17.0'
+  # Public OAuth Client ID; no Slack client secret belongs in a desktop build.
+  PHOSCHAT_SLACK_CLIENT_ID: ${{ vars.SLACK_CLIENT_ID || secrets.SLACK_CLIENT_ID }}
+  PHOSCHAT_SLACK_OAUTH_ORIGIN: ${{ vars.SLACK_OAUTH_ORIGIN }}
 
 jobs:
   version:
@@ -32,7 +35,7 @@ jobs:
       number: ${{ steps.check.outputs.version }}
     steps:
       - uses: actions/checkout@v4
-      - name: Verify Telegram application configuration
+      - name: Verify application build configuration
         env:
           PHOSCHAT_TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
           PHOSCHAT_TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
@@ -66,7 +69,7 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends build-essential ca-certificates cmake \
             desktop-file-utils dpkg-dev file git ninja-build qt6-base-dev libqt6sql6-sqlite \
-            qtkeychain-qt6-dev
+            qtkeychain-qt6-dev dbus-daemon
       - uses: actions/checkout@v4
       - name: Configure DEB with the Telegram application identity
         env:
@@ -102,7 +105,7 @@ jobs:
       - name: Install Fedora build dependencies
         run: |
           dnf install -y git gcc-c++ cmake ninja-build rpm-build qt6-qtbase-devel \
-            qtkeychain-qt6-devel openssl-devel zlib-devel gperf ca-certificates
+            qtkeychain-qt6-devel openssl-devel zlib-devel gperf ca-certificates dbus-daemon
       - uses: actions/checkout@v4
       - name: Build the TDLib JSON runtime
         run: |

@@ -9,6 +9,7 @@ namespace {
     constexpr QStringView Libera = u"irc.libera.chat";
     constexpr QStringView Oftc = u"irc.oftc.net";
     constexpr QStringView Hackint = u"irc.hackint.org";
+    constexpr QStringView ChatHispano = u"ssl.chathispano.com";
     constexpr QStringView Python = u"https://www.python.org/community/irc/";
     constexpr QStringView Brainz = u"https://musicbrainz.org/doc/Communication/ChatBrainz";
     constexpr QStringView Debian = u"https://wiki.debian.org/IRC";
@@ -19,6 +20,7 @@ namespace {
         NetworkSuggestion { u"hackint", Hackint, 6697 },
         NetworkSuggestion { u"DALnet", u"irc.dal.net", 6697 },
         NetworkSuggestion { u"Snoonet", u"irc.snoonet.org", 6697 },
+        NetworkSuggestion { u"ChatHispano", ChatHispano, 6697 },
     };
 
     constexpr std::array Channels {
@@ -49,6 +51,20 @@ namespace {
             u"Questions about the hackint network", u"https://hackint.org/support" },
         ChannelSuggestion {
             Libera, u"#libera", u"IRC", u"Libera.Chat network support", u"https://libera.chat/guides/faq" },
+        ChannelSuggestion { ChatHispano, u"#chathispano", u"Comunidad · Español",
+            u"Conversación general en la red ChatHispano", u"https://chathispano.com/canal/chathispano" },
+        ChannelSuggestion { ChatHispano, u"#irc-hispano", u"IRC · Español",
+            u"Sala de bienvenida de ChatHispano", u"https://chathispano.com/canal/irc-hispano" },
+        ChannelSuggestion { ChatHispano, u"#opers_help", u"Ayuda · Español",
+            u"Soporte oficial de la red ChatHispano", u"https://chathispano.com/canal/opers_help" },
+        ChannelSuggestion { ChatHispano, u"#madrid", u"Ciudades · Español", u"Charla sobre Madrid",
+            u"https://chathispano.com/canal/madrid" },
+        ChannelSuggestion { ChatHispano, u"#amistad", u"Comunidad · Español", u"Charla para hacer amistades",
+            u"https://chathispano.com/canal/amistad" },
+        ChannelSuggestion { ChatHispano, u"#musica", u"Música · Español",
+            u"Conversación sobre gustos musicales", u"https://chathispano.com/canal/musica" },
+        ChannelSuggestion { ChatHispano, u"#informatica", u"Tecnología · Español",
+            u"Conversación sobre informática", u"https://chathispano.com/canal/informatica" },
     };
 
 } // namespace

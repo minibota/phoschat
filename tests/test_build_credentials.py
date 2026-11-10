@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -33,6 +34,8 @@ class BuildCredentialsTest(unittest.TestCase):
         self.environment = dict(os.environ)
         self.environment.pop("PHOSCHAT_TELEGRAM_API_ID", None)
         self.environment.pop("PHOSCHAT_TELEGRAM_API_HASH", None)
+        self.environment.pop("PHOSCHAT_SLACK_CLIENT_ID", None)
+        self.environment.pop("PHOSCHAT_SLACK_OAUTH_ORIGIN", None)
         self.counter = 0
 
     def configure(self, api_id="", api_hash="", *arguments):
@@ -128,6 +131,91 @@ class BuildCredentialsTest(unittest.TestCase):
             env=environment, capture_output=True, text=True, check=False)
         self.assertEqual(result.returncode, 0)
         self.assertEqual(result.stdout + result.stderr, "")
+
+    def test_public_slack_id_reaches_flatpak_without_changing_private_credentials(self):
+        helper_path = ROOT / "packaging/prepare-telegram-build.py"
+        spec = importlib.util.spec_from_file_location("slack_build", helper_path)
+        helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(helper)
+        directory = self.root / "packaging/flatpak"
+        directory.mkdir(parents=True)
+        shutil.copy(ROOT / "packaging/flatpak/io.phoschat.desktop.json", directory)
+        helper.prepare_flatpak(self.root, {"api_id": TEST_ID, "api_hash": TEST_HASH}, "12345.67890",
+                               "https://oauth.example.test")
+        manifest = (directory / "io.phoschat.desktop.private.json").read_text()
+        self.assertIn("-DPHOSCHAT_SLACK_CLIENT_ID=12345.67890", manifest)
+        self.assertIn("-DPHOSCHAT_SLACK_OAUTH_ORIGIN=https://oauth.example.test", manifest)
+        self.assertNotIn(TEST_HASH, manifest)
+
+
+class SlackBuildConfigurationTest(unittest.TestCase):
+    def test_optional_public_id_and_invalid_inputs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "source"
+            source.mkdir()
+            module = (ROOT / "cmake/SlackApplication.cmake").as_posix()
+            (source / "CMakeLists.txt").write_text(
+                'cmake_minimum_required(VERSION 3.22)\n'
+                'project(SlackPublicIdTest LANGUAGES NONE)\n'
+                f'include("{module}")\n'
+                'phoschat_configure_slack_application("${PROJECT_BINARY_DIR}/generated")\n')
+            for index, value in enumerate(("", "12345.67890", "invalid", "123.456\";evil", "1." + "1" * 33)):
+                with self.subTest(value=value):
+                    build = Path(temporary) / str(index)
+                    result = subprocess.run(
+                        ["cmake", "-S", str(source), "-B", str(build)],
+                        env=dict(os.environ) | {"PHOSCHAT_SLACK_CLIENT_ID": value,
+                                                "PHOSCHAT_SLACK_OAUTH_ORIGIN": ""},
+                        capture_output=True, text=True, check=False)
+                    self.assertEqual(result.returncode == 0, index < 2, result.stderr)
+                    if index < 2:
+                        self.assertIn(f'#define PHOSCHAT_SLACK_CLIENT_ID "{value}"',
+                                      (build / "generated/slack_build_config.h").read_text())
+
+    def test_public_https_origin_validation_matches_flatpak(self):
+        helper_path = ROOT / "packaging/prepare-telegram-build.py"
+        spec = importlib.util.spec_from_file_location("slack_origin_build", helper_path)
+        helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(helper)
+        valid = ("", "https://oauth.example.test", "https://a.b", "https://xn--bcher-kva.example",
+                 "https://" + ".".join(["a" * 63, "b" * 63, "c" * 63, "d" * 61]))
+        invalid = ("http://oauth.example.test", "https://localhost", "https://127.0.0.1",
+                   "https://[::1]", "https://example.test/", "https://example.test/callback",
+                   "https://user@example.test", "https://example.test:443", "https://example.test?q=1",
+                   "https://example.test#fragment", "https://a..test", "https://-a.example",
+                   "https://a-.example", "https://a.example.", "https://a.123", "https://a.example\n",
+                   "https://a.example;injected", "https://" + "a" * 64 + ".test",
+                   "https://" + ".".join(["a" * 63, "b" * 63, "c" * 63, "d" * 62]))
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "source"
+            source.mkdir()
+            module = (ROOT / "cmake/SlackApplication.cmake").as_posix()
+            (source / "CMakeLists.txt").write_text(
+                'cmake_minimum_required(VERSION 3.22)\n'
+                'project(SlackOriginTest LANGUAGES NONE)\n'
+                f'include("{module}")\n'
+                'phoschat_configure_slack_application("${PROJECT_BINARY_DIR}/generated")\n')
+            cases = [(origin, "12345.67890", origin in valid) for origin in valid + invalid]
+            cases.append(("https://oauth.example.test", "", False))
+            for index, (origin, client_id, accepted) in enumerate(cases):
+                with self.subTest(origin=origin, client_id=client_id):
+                    environment = {"PHOSCHAT_SLACK_CLIENT_ID": client_id,
+                                   "PHOSCHAT_SLACK_OAUTH_ORIGIN": origin}
+                    with patch.dict(os.environ, environment):
+                        if accepted:
+                            self.assertEqual(helper.slack_oauth_origin_from_environment(client_id), origin)
+                        else:
+                            with self.assertRaises(ValueError):
+                                helper.slack_oauth_origin_from_environment(client_id)
+                    build = Path(temporary) / str(index)
+                    result = subprocess.run(
+                        ["cmake", "-S", str(source), "-B", str(build)],
+                        env=dict(os.environ) | environment,
+                        capture_output=True, text=True, check=False)
+                    self.assertEqual(result.returncode == 0, accepted, result.stderr)
+                    if accepted:
+                        self.assertIn(f'#define PHOSCHAT_SLACK_OAUTH_ORIGIN "{origin}"',
+                                      (build / "generated/slack_build_config.h").read_text())
 
 
 if __name__ == "__main__":

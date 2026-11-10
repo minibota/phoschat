@@ -2,6 +2,7 @@
 
 #include "core/account_manager.h"
 #include "providers/irc/irc_directory.h"
+#include "providers/slack/slack_app_config.h"
 #include "security/telegram_app_credentials.h"
 #include "ui/Presentation.hpp"
 
@@ -121,6 +122,9 @@ AccountDialog::AccountDialog(AccountManager &accounts, QWidget *parent)
     m_customTelegramApplication = new QCheckBox(tr("Use your own Telegram application (advanced)"));
     m_customTelegramApplication->setObjectName(QStringLiteral("customTelegramApplication"));
     cloud->addRow(m_customTelegramApplication);
+    m_customSlackApplication = new QCheckBox(tr("Use a workspace app or token (advanced)"));
+    m_customSlackApplication->setObjectName(QStringLiteral("customSlackApplication"));
+    cloud->addRow(m_customSlackApplication);
     m_providerId = new QLineEdit;
     m_providerId->setObjectName(QStringLiteral("providerApplicationId"));
     m_providerId->setMaxLength(96);
@@ -188,6 +192,7 @@ AccountDialog::AccountDialog(AccountManager &accounts, QWidget *parent)
     connect(m_protocol, &QComboBox::currentIndexChanged, this, &AccountDialog::refreshProtocolFields);
     connect(m_ircPreset, &QComboBox::currentIndexChanged, this, &AccountDialog::applyIrcPreset);
     connect(m_customTelegramApplication, &QCheckBox::toggled, this, &AccountDialog::refreshProtocolFields);
+    connect(m_customSlackApplication, &QCheckBox::toggled, this, &AccountDialog::refreshProtocolFields);
     connect(m_tls, &QCheckBox::toggled, this, [this](bool tls) {
         if (m_port->value() == (tls ? 6667 : 6697)) {
             m_port->setValue(tls ? 6697 : 6667);
@@ -264,7 +269,14 @@ void AccountDialog::loadSelected()
             !account.providerId.isEmpty() || (isNew && !bundledTelegramCredentialsAvailable()));
     }
     m_customTelegramApplication->setEnabled(isNew);
+    {
+        const QSignalBlocker customBlocker(m_customSlackApplication);
+        m_customSlackApplication->setChecked(
+            !isNew && (!bundledSlackApplicationAvailable() || account.providerId != bundledSlackClientId()));
+    }
+    m_customSlackApplication->setEnabled(isNew);
     m_telegramDefaultsApplied = !isNew;
+    m_slackDefaultsApplied = !isNew;
     m_remember->setChecked(account.saveSecret);
     m_autoConnect->setChecked(account.autoConnect);
     m_password->clear();
@@ -341,20 +353,28 @@ void AccountDialog::refreshProtocolFields()
     const auto protocol = static_cast<Protocol>(m_protocol->currentData().toInt());
     const bool irc = protocol == Protocol::Irc;
     const bool telegram = protocol == Protocol::Telegram;
+    const bool slack = protocol == Protocol::Slack;
     const bool existing = !m_account->currentData().toString().isEmpty();
     const bool bundled = bundledTelegramCredentialsAvailable();
     const bool customTelegram = m_customTelegramApplication->isChecked();
-    const bool showProviderCredentials = !telegram || customTelegram;
+    const bool slackConfigured = bundledSlackApplicationAvailable();
+    const bool customSlack = m_customSlackApplication->isChecked();
+    const bool showProviderCredentials = telegram ? customTelegram : slack && customSlack;
     if (telegram && !existing && !m_telegramDefaultsApplied) {
         m_remember->setChecked(m_accounts.persistentSecretsAvailable());
         m_telegramDefaultsApplied = true;
+    }
+    if (slack && !existing && !m_slackDefaultsApplied) {
+        m_remember->setChecked(m_accounts.persistentSecretsAvailable());
+        m_slackDefaultsApplied = true;
     }
     m_ircNetwork->setVisible(irc);
     m_ircAuthentication->setVisible(irc);
     refreshIrcEndpointFields();
     m_cloudSettings->setVisible(!irc);
-    m_cloudSettings->setTitle(telegram ? tr("Telegram sign-in") : tr("Provider setup"));
+    m_cloudSettings->setTitle(telegram ? tr("Telegram sign-in") : tr("Slack sign-in"));
     m_customTelegramApplication->setVisible(telegram && bundled && !existing);
+    m_customSlackApplication->setVisible(slack && (!existing || customSlack));
     m_providerIdLabel->setVisible(showProviderCredentials);
     m_providerId->setVisible(showProviderCredentials);
     m_cloudSecretLabel->setVisible(showProviderCredentials);
@@ -391,13 +411,25 @@ void AccountDialog::refreshProtocolFields()
                          "<a href='https://github.com/minibota/phoschat/blob/main/docs/telegram.md'>Build "
                          "and setup guide</a>"));
         }
-    } else {
-        m_cloudHint->setText(
-            tr("Use a PKCE-enabled Slack app approved for your workspace. "
-               "<a href='https://github.com/minibota/phoschat/blob/main/docs/slack.md'>Slack setup</a>"));
+    } else if (slack) {
+        if (!customSlack && slackConfigured) {
+            m_cloudHint->setText(tr("Connect in your browser and choose your workspace. Slack may ask "
+                                    "your workspace administrator to approve PhosChat."));
+        } else if (customSlack) {
+            m_cloudHint->setText(tr("Enter the public Client ID supplied by your workspace administrator "
+                                    "for browser sign-in, or a user token. Never enter a client secret. "
+                                    "<a href='https://github.com/minibota/phoschat/blob/main/docs/slack.md'>"
+                                    "Administrator setup</a>"));
+        } else {
+            m_cloudHint->setText(tr("Slack sign-in is not configured in this build. Your administrator "
+                                    "can provide a configured build or a workspace app through Advanced. "
+                                    "<a href='https://github.com/minibota/phoschat/blob/main/docs/slack.md'>"
+                                    "Administrator setup</a>"));
+        }
     }
-    m_connectButton->setEnabled(
-        m_accounts.protocolAvailable(protocol) && (!telegram || customTelegram || bundled));
+    m_connectButton->setText(slack && !customSlack ? tr("Connect to Slack") : tr("Save && connect"));
+    m_connectButton->setEnabled(m_accounts.protocolAvailable(protocol)
+        && (!telegram || customTelegram || bundled) && (!slack || customSlack || slackConfigured));
     refreshStatus();
 }
 
@@ -422,6 +454,13 @@ void AccountDialog::save(bool connectAfter)
     const auto nick = m_nick->text().trimmed();
     const auto saslUser = m_saslUser->text().trimmed();
     const auto protocol = static_cast<Protocol>(m_protocol->currentData().toInt());
+    if (protocol == Protocol::Slack && !m_customSlackApplication->isChecked()
+        && !bundledSlackApplicationAvailable()) {
+        m_feedback->setText(tr("This build needs a Slack application configured by its distributor. "
+                               "Use Advanced if your workspace administrator supplied an app or token."));
+        m_feedback->show();
+        return;
+    }
     if (protocol == Protocol::Irc && (host.isEmpty() || nick.isEmpty())) {
         m_feedback->setText(tr("Enter a server and nickname."));
         m_feedback->show();
@@ -453,6 +492,9 @@ void AccountDialog::save(bool connectAfter)
         account.tls = m_tls->isChecked();
         account.nick = nick;
         account.saslUser = saslUser;
+    } else if (protocol == Protocol::Slack && !m_customSlackApplication->isChecked()) {
+        account.providerId = m_account->currentData().toString().isEmpty() ? bundledSlackClientId()
+                                                                           : m_providerId->text().trimmed();
     } else if (protocol != Protocol::Telegram || m_customTelegramApplication->isChecked()) {
         account.providerId = m_providerId->text().trimmed();
     }
@@ -461,7 +503,8 @@ void AccountDialog::save(bool connectAfter)
 
     auto password
         = protocol == Protocol::Irc ? m_password->text().toUtf8() : m_cloudSecret->text().trimmed().toUtf8();
-    if (protocol == Protocol::Telegram && !m_customTelegramApplication->isChecked()) {
+    if ((protocol == Protocol::Telegram && !m_customTelegramApplication->isChecked())
+        || (protocol == Protocol::Slack && !m_customSlackApplication->isChecked())) {
         password.fill('\0');
         password.clear();
     }

@@ -129,6 +129,11 @@ private slots:
     void parsesAndBoundsFrames();
     void foldsNamesAndStripsFormatting();
     void legacyPlaintextRegistration();
+    void retrievesContactProfiles();
+    void reportsChannelJoinResults();
+    void confirmsServerEchoedMessages();
+    void observesDirectPeerPresence_data();
+    void observesDirectPeerPresence();
     void listsPublicChannels();
     void boundsChannelDirectory();
     void searchesCuratedDirectory();
@@ -226,10 +231,214 @@ void IrcTest::legacyPlaintextRegistration()
     QTRY_VERIFY(server.commands.contains("PONG :while-online"));
     QVERIFY(errors.isEmpty());
     QVERIFY(!provider.capabilities().testFlag(Capability::RemoteHistory));
-    QVERIFY(!provider.capabilities().testFlag(Capability::Presence));
     provider.disconnectAccount();
     QCOMPARE(latestState(states), ConnectionState::Disconnected);
     QTRY_VERIFY(server.commands.contains("QUIT :PhosChat closing"));
+}
+
+void IrcTest::retrievesContactProfiles()
+{
+    IrcLoopbackServer server({});
+    QVERIFY(server.listen(QHostAddress::LocalHost));
+    const auto account = loopbackAccount(server.serverPort(), false);
+    IrcProvider provider(account);
+    QSignalSpy states(&provider, &IChatProvider::stateChanged);
+    QSignalSpy profiles(&provider, &IChatProvider::profileReceived);
+    const ConversationId alice { account.id, QStringLiteral("alice{") };
+    const ConversationId bob { account.id, QStringLiteral("bob") };
+    QVERIFY(!provider.requestProfile(alice));
+
+    provider.connectAccount({});
+    QTRY_COMPARE(server.commands.size(), 3);
+    server.send(":irc 001 Tester :Welcome\r\n:irc 422 Tester :No MOTD\r\n");
+    QTRY_COMPARE(latestState(states), ConnectionState::Connected);
+    QVERIFY(!provider.requestProfile({ account.id, QStringLiteral("#channel") }));
+    QVERIFY(!provider.requestProfile({ account.id, QStringLiteral("ali*ce") }));
+    QVERIFY(!provider.requestProfile({ QStringLiteral("other-network"), alice.remoteId }));
+    QVERIFY(provider.requestProfile(alice));
+    QVERIFY(provider.requestProfile(alice));
+    QVERIFY(provider.requestProfile(bob));
+    QTRY_VERIFY(server.commands.contains("WHOIS bob"));
+    QCOMPARE(server.commands.count("WHOIS alice{"), 1);
+
+    server.send(":irc 311 Tester Alice[ test-user private-host * :\x02"
+                "Alice Example\x02\r\n"
+                ":irc 311 SomeoneElse Bob unrelated-user unrelated-host * :Other recipient\r\n"
+                ":irc 330 Tester ALICE[ alice-account :is logged in as\r\n"
+                ":irc 401 Tester BOB :No such nick\r\n"
+                ":irc 312 Tester Alice[ example.test :Server description\r\n"
+                ":irc 301 Tester Alice[ :Taking a break\r\n"
+                ":irc 318 Tester ALICE[ :End of WHOIS\r\n");
+    QTRY_COMPARE(profiles.size(), 2);
+    QCOMPARE(profiles.at(0).at(0).value<ConversationId>(), bob);
+    QVERIFY(profiles.at(0).at(1).value<ProfileDetails>().isEmpty());
+    QCOMPARE(profiles.at(1).at(0).value<ConversationId>(), alice);
+    const ProfileDetails expected {
+        { QStringLiteral("Real name"), QStringLiteral("Alice Example") },
+        { QStringLiteral("Username"), QStringLiteral("test-user") },
+        { QStringLiteral("IRC account"), QStringLiteral("alice-account") },
+        { QStringLiteral("IRC server"), QStringLiteral("example.test") },
+        { QStringLiteral("Away"), QStringLiteral("Taking a break") },
+    };
+    QCOMPARE(profiles.at(1).at(1).value<ProfileDetails>(), expected);
+
+    QVERIFY(provider.requestProfile(alice));
+    provider.disconnectAccount();
+    QCOMPARE(profiles.size(), 3);
+    QCOMPARE(profiles.constLast().at(0).value<ConversationId>(), alice);
+    QVERIFY(profiles.constLast().at(1).value<ProfileDetails>().isEmpty());
+}
+
+void IrcTest::reportsChannelJoinResults()
+{
+    IrcLoopbackServer server({});
+    QVERIFY(server.listen(QHostAddress::LocalHost));
+    const auto account = loopbackAccount(server.serverPort(), false);
+    IrcProvider provider(account);
+    QSignalSpy states(&provider, &IChatProvider::stateChanged);
+    QSignalSpy conversations(&provider, &IChatProvider::conversationChanged);
+    QSignalSpy failures(&provider, &IChatProvider::joinFailed);
+    QSignalSpy notices(&provider, &IChatProvider::notice);
+    provider.connectAccount({});
+    QTRY_COMPARE(server.commands.size(), 3);
+    server.send(":irc 001 Tester :Welcome\r\n:irc 422 Tester :No MOTD\r\n");
+    QTRY_COMPARE(latestState(states), ConnectionState::Connected);
+
+    QVERIFY(provider.join(QStringLiteral("#Open")));
+    QVERIFY(provider.join(QStringLiteral("#Restricted")));
+    QTRY_VERIFY(server.commands.contains("JOIN #Restricted"));
+    server.send(":irc 475 SomeoneElse #Open :Other recipient\r\n"
+                ":irc 475 TESTER #RESTRICTED :Untrusted failure detail\r\n"
+                ":Tester!u@host JOIN #Open\r\n");
+    QTRY_COMPARE(failures.size(), 1);
+    QCOMPARE(failures.constFirst().at(0).value<ConversationId>(),
+        ConversationId({ account.id, QStringLiteral("#restricted") }));
+    QCOMPARE(failures.constFirst().at(1).toString(), QStringLiteral("The IRC channel requires a valid key."));
+    QVERIFY(notices.isEmpty());
+    QTRY_COMPARE(conversations.size(), 1);
+    QVERIFY(conversations.constFirst().at(0).value<Conversation>().joined);
+
+    QVERIFY(provider.join(QStringLiteral("#OPEN")));
+    QCOMPARE(conversations.size(), 2);
+    QVERIFY(conversations.constLast().at(0).value<Conversation>().joined);
+    QVERIFY(provider.join(QStringLiteral("#Full")));
+    QTRY_VERIFY(server.commands.contains("JOIN #Full"));
+    QVERIFY(!server.commands.contains("JOIN #OPEN"));
+    server.send(":irc FAIL JOIN CHANNEL_FULL #FULL :Untrusted failure detail\r\n");
+    QTRY_COMPARE(failures.size(), 2);
+    QCOMPARE(failures.constLast().at(0).value<ConversationId>(),
+        ConversationId({ account.id, QStringLiteral("#full") }));
+    QVERIFY(notices.isEmpty());
+}
+
+void IrcTest::confirmsServerEchoedMessages()
+{
+    IrcLoopbackServer server({});
+    QVERIFY(server.listen(QHostAddress::LocalHost));
+    const auto account = loopbackAccount(server.serverPort(), false);
+    IrcProvider provider(account);
+    QSignalSpy states(&provider, &IChatProvider::stateChanged);
+    QSignalSpy messages(&provider, &IChatProvider::messageReceived);
+    provider.connectAccount({});
+    QTRY_COMPARE(server.commands.size(), 3);
+    server.send(":irc CAP * LS :echo-message\r\n");
+    QTRY_VERIFY(server.commands.contains("CAP REQ :echo-message"));
+    QVERIFY(!server.commands.contains("CAP END"));
+    server.send(":irc CAP * ACK :echo-message\r\n:irc 001 Tester :Welcome\r\n:irc 422 Tester :No MOTD\r\n");
+    QTRY_COMPARE(latestState(states), ConnectionState::Connected);
+    QTRY_VERIFY(server.commands.contains("CAP END"));
+
+    const ConversationId bob { account.id, QStringLiteral("bob") };
+    QVERIFY(provider.sendText(bob, QStringLiteral("Hello")));
+    QTRY_VERIFY(server.commands.contains("PRIVMSG bob :Hello"));
+    QVERIFY(messages.isEmpty());
+    server.send(":Tester!user@host PRIVMSG Bob :HELLO\r\n:Bob!user@host PRIVMSG Tester :Hi\r\n");
+    QTRY_COMPARE(messages.size(), 2);
+    const auto sent = messages.at(0).at(0).value<Message>();
+    QCOMPARE(sent.conversation, bob);
+    QCOMPARE(sent.text, QStringLiteral("HELLO"));
+    QVERIFY(sent.outgoing);
+    QCOMPARE(sent.delivery, DeliveryState::Sent);
+    const auto reply = messages.at(1).at(0).value<Message>();
+    QCOMPARE(reply.conversation, bob);
+    QVERIFY(!reply.outgoing);
+    QCOMPARE(reply.delivery, DeliveryState::None);
+
+    server.send(":irc CAP Tester DEL :echo-message\r\nPING :after-cap-del\r\n");
+    QTRY_VERIFY(server.commands.contains("PONG :after-cap-del"));
+    QVERIFY(provider.sendText(bob, QStringLiteral("Goodbye")));
+    QCOMPARE(messages.size(), 3);
+    const auto local = messages.constLast().at(0).value<Message>();
+    QVERIFY(local.outgoing);
+    QCOMPARE(local.delivery, DeliveryState::None);
+}
+
+void IrcTest::observesDirectPeerPresence_data()
+{
+    QTest::addColumn<bool>("supported");
+    QTest::newRow("present-and-absent") << true;
+    QTest::newRow("unsupported") << false;
+}
+
+void IrcTest::observesDirectPeerPresence()
+{
+    QFETCH(bool, supported);
+    IrcLoopbackServer server({});
+    QVERIFY(server.listen(QHostAddress::LocalHost));
+    const auto account = loopbackAccount(server.serverPort(), false);
+    IrcProvider provider(account);
+    QSignalSpy states(&provider, &IChatProvider::stateChanged);
+    QSignalSpy updates(&provider, &IChatProvider::presenceChanged);
+    QVERIFY(provider.capabilities().testFlag(Capability::Presence));
+    const ConversationId alice { account.id, QStringLiteral("alice{") };
+    const ConversationId bob { account.id, QStringLiteral("bob") };
+    provider.setConversationOpen(alice, true); // Offline. Open chats are replayed once connected.
+
+    provider.connectAccount({});
+    QTRY_COMPARE(server.commands.size(), 3);
+    server.send(":irc 001 Tester :Welcome\r\n:irc 422 Tester :No MOTD\r\nPING :before-watch\r\n");
+    QTRY_COMPARE(latestState(states), ConnectionState::Connected);
+    QTRY_VERIFY(server.commands.contains("PONG :before-watch"));
+    const auto isIson = [](const QByteArray &command) { return command.startsWith("ISON "); };
+    QVERIFY(!std::ranges::any_of(server.commands, isIson));
+
+    provider.setConversationOpen({ account.id, QStringLiteral("#channel") }, true);
+    provider.setConversationOpen({ QStringLiteral("another-account"), QStringLiteral("carol") }, true);
+    provider.setConversationOpen(alice, true);
+    provider.setConversationOpen(bob, true);
+    QTRY_VERIFY(server.commands.contains("ISON alice{ bob"));
+    QCOMPARE(std::ranges::count_if(server.commands, isIson), 1);
+    if (!supported) {
+        server.send(":irc 421 Tester ISON :Unknown command\r\nPING :ison-rejected\r\n");
+        QTRY_VERIFY(server.commands.contains("PONG :ison-rejected"));
+        provider.setConversationOpen({ account.id, QStringLiteral("dave") }, true);
+        server.send(":irc 303 Tester :alice{ bob\r\nPING :after-rejection\r\n");
+        QTRY_VERIFY(server.commands.contains("PONG :after-rejection"));
+        QCOMPARE(std::ranges::count_if(server.commands, isIson), 1);
+        QVERIFY(updates.isEmpty());
+        return;
+    }
+
+    server.send(":irc 303 SomeoneElse :Bob\r\n"
+                ":irc 303 Tester :Unrelated\r\n"
+                "PING :unrelated-reply\r\n");
+    QTRY_VERIFY(server.commands.contains("PONG :unrelated-reply"));
+    QVERIFY(updates.isEmpty());
+    server.send(":irc 303 TESTER :Alice[\r\n");
+    QTRY_COMPARE(updates.size(), 2);
+    QCOMPARE(updates.at(0).at(0).value<ConversationId>(), alice);
+    QCOMPARE(updates.at(0).at(1).value<Presence>(), Presence::Online);
+    QCOMPARE(updates.at(1).at(0).value<ConversationId>(), bob);
+    QCOMPARE(updates.at(1).at(1).value<Presence>(), Presence::Offline);
+
+    provider.setConversationOpen(bob, false);
+    QCOMPARE(updates.size(), 3);
+    QCOMPARE(updates.constLast().at(0).value<ConversationId>(), bob);
+    QCOMPARE(updates.constLast().at(1).value<Presence>(), Presence::Unknown);
+    provider.disconnectAccount();
+    QCOMPARE(updates.size(), 4);
+    QCOMPARE(updates.constLast().at(0).value<ConversationId>(), alice);
+    QCOMPARE(updates.constLast().at(1).value<Presence>(), Presence::Unknown);
 }
 
 void IrcTest::listsPublicChannels()
@@ -313,8 +522,17 @@ void IrcTest::boundsChannelDirectory()
 void IrcTest::searchesCuratedDirectory()
 {
     const auto networks = irc::recommendedNetworks();
-    QCOMPARE(networks.size(), 5);
     const auto suggestions = irc::recommendedChannels();
+    const auto hispano
+        = std::ranges::find(networks, QStringView(u"ChatHispano"), &irc::NetworkSuggestion::name);
+    QVERIFY(hispano != networks.end());
+    QCOMPARE(hispano->host, QStringView(u"ssl.chathispano.com"));
+    QCOMPARE(hispano->port, 6697);
+    const auto help
+        = std::ranges::find(suggestions, QStringView(u"#opers_help"), &irc::ChannelSuggestion::name);
+    QVERIFY(help != suggestions.end());
+    QCOMPARE(help->networkHost, hispano->host);
+    QVERIFY(irc::matchesDirectorySearch(u"ChatHispano ayuda", { hispano->name, help->category }));
     const auto spanish = std::ranges::find(suggestions, QStringView(u"#pyar"), &irc::ChannelSuggestion::name);
     QVERIFY(spanish != suggestions.end());
     QVERIFY(irc::matchesDirectorySearch(
@@ -435,6 +653,7 @@ void IrcTest::negotiatesTlsSaslAndExchangesMessages()
     QCOMPARE(messages.size(), 3);
     const auto outgoing = messages.constLast().at(0).value<Message>();
     QVERIFY(outgoing.outgoing);
+    QCOMPARE(outgoing.delivery, DeliveryState::None);
     QVERIFY(outgoing.id.startsWith(QStringLiteral("local:")));
     QVERIFY(!provider.sendText(channelMessage.conversation, QStringLiteral("x\r\nJOIN #other")));
     QVERIFY(!provider.sendText(channelMessage.conversation, QString(300, u'é')));

@@ -20,6 +20,7 @@ The [loopback demo server](../tests/demo_irc_server.py) advertises three sample 
 | [hackint](https://www.hackint.org/servers) | `irc.hackint.org:6697` | Hacker community and network support |
 | [DALnet](https://www.dal.net/servers/) | `irc.dal.net:6697` | General chat; use the live directory to find channels |
 | [Snoonet](https://snoonet.org/irc-servers/) | `irc.snoonet.org:6697` | Community chat; use the live directory to find channels |
+| [ChatHispano](https://chathispano.com/noticias/ya-hay-un-servidor-con-soporte-ssl-en-chat-hispano) | `ssl.chathispano.com:6697` | General chat, [network help](https://chathispano.com/canal/opers_help), Madrid, friendship, music and computing in Spanish |
 
 Preset TLS endpoints were checked against the networks' own documentation on 2026-11-10, including [DALnet's connection guide](https://docs.dal.net/docs/newbie.html). Presets do not establish a connection or join channels until you choose to do so. Their availability and access policies remain controlled by each network.
 

@@ -11,6 +11,7 @@ int main(int argc, char *argv[])
     QCoreApplication::setApplicationName(QStringLiteral("PhosChat"));
     QCoreApplication::setApplicationVersion(QStringLiteral(PHOSCHAT_VERSION));
     QApplication::setApplicationDisplayName(QStringLiteral("PhosChat"));
+    QApplication::setDesktopFileName(QStringLiteral("io.phoschat.desktop"));
     QApplication::setWindowIcon(phoschat::ui::brandIcon());
 
     QCommandLineParser parser;

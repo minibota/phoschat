@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QIcon>
+#include <QPixmap>
 
 class QApplication;
 
@@ -13,6 +14,7 @@ void applyTheme(QApplication &application, Theme theme);
 void setPreferredTheme(QApplication &application, Theme theme);
 QIcon brandIcon();
 QIcon conversationIcon(bool channel);
+QPixmap photoAvatar(const QByteArray &jpeg, int side, qreal devicePixelRatio);
 QIcon searchIcon();
 QIcon moreIcon();
 QIcon addIcon();

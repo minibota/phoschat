@@ -101,7 +101,39 @@ private slots:
     void rejoinsAndKeepsHistoryAfterReconnect();
     void keepsNetworkIdentityAndDeletesLocalData();
     void cloudHistoryIsTransientAndReplayIsQuiet();
+    void contactPresenceIsTransientAndClearsOnDisconnect();
 };
+
+void CoreTest::contactPresenceIsTransientAndClearsOnDisconnect()
+{
+    Database database(u":memory:"_s);
+    QVERIFY(database.open());
+    CredentialStore credentials;
+    AccountManager accounts(database, credentials, nullptr, makeProvider);
+    ConversationManager conversations(accounts, database);
+    const auto account = testAccount();
+    QVERIFY(accounts.saveAccount(account));
+    accounts.connectAccount(account.id);
+    auto *provider = static_cast<TestProvider *>(accounts.provider(account.id));
+    QVERIFY(provider);
+    const auto direct = conversations.openDirect(account.id, u"Contact"_s);
+    QVERIFY(direct.isValid());
+    emit provider->presenceChanged(direct, Presence::Online);
+    QCOMPARE(conversations.conversation(direct)->presence, Presence::Online);
+    QCOMPARE(database.conversations().constFirst().presence, Presence::Unknown);
+
+    auto metadata = database.conversations().constFirst();
+    metadata.title = u"New contact name"_s;
+    emit provider->conversationChanged(metadata);
+    QCOMPARE(conversations.conversation(direct)->title, metadata.title);
+    QCOMPARE(conversations.conversation(direct)->presence, Presence::Online);
+
+    provider->loseConnection();
+    QCOMPARE(accounts.state(account.id), ConnectionState::Reconnecting);
+    QCOMPARE(conversations.conversation(direct)->presence, Presence::Unknown);
+    emit provider->presenceChanged(direct, Presence::Offline);
+    QCOMPARE(conversations.conversation(direct)->presence, Presence::Unknown);
+}
 
 void CoreTest::cloudHistoryIsTransientAndReplayIsQuiet()
 {
@@ -193,10 +225,14 @@ void CoreTest::rejoinsAndKeepsHistoryAfterReconnect()
     accounts.connectAccount(account.id);
     auto *provider = static_cast<TestProvider *>(accounts.provider(account.id));
     const ConversationId id { account.id, u"#phoschat"_s };
+    QSignalSpy joins(&conversations, &ConversationManager::channelJoined);
     QVERIFY(conversations.joinChannel(account.id, u"#PhosChat"_s));
     QVERIFY(!conversations.conversation(id));
     QVERIFY(!messages.canSend(id));
+    QVERIFY(joins.isEmpty());
     provider->confirmJoin(u"#PhosChat"_s);
+    QCOMPARE(joins.size(), 1);
+    QCOMPARE(joins.constFirst().constFirst().value<ConversationId>(), id);
     QVERIFY(messages.canSend(id));
     provider->receive(Message { id, u"history"_s, u"Peer"_s, u"Hello"_s, QDateTime::currentDateTimeUtc() });
 
@@ -207,6 +243,7 @@ void CoreTest::rejoinsAndKeepsHistoryAfterReconnect()
     QCOMPARE(provider->joined, (QStringList { u"#PhosChat"_s, u"#PhosChat"_s }));
     QCOMPARE(messages.history(id).size(), 1);
     provider->confirmJoin(u"#PhosChat"_s);
+    QCOMPARE(joins.size(), 1); // Reconnecting doesn't open the channel again.
     QVERIFY(conversations.partChannel(id));
     QCOMPARE(provider->parted, QStringList { u"#PhosChat"_s });
     QVERIFY(!conversations.conversation(id)->autoJoin);

@@ -27,6 +27,8 @@ public:
     bool part(const QString &target) override;
     bool sendText(const ConversationId &conversation, const QString &text) override;
     bool sendCommand(const ConversationId &conversation, const QString &command) override;
+    bool requestProfile(const ConversationId &id) override;
+    void setConversationOpen(const ConversationId &id, bool open) override;
     [[nodiscard]] QString canonicalTarget(const QString &target) const override;
     [[nodiscard]] QString requestChannelList();
     [[nodiscard]] irc::ChannelListStatus channelListStatus() const { return channelListStatus_; }
@@ -44,6 +46,13 @@ private:
         bool readingNames = false;
     };
 
+    struct WhoisRequest {
+        ConversationId id;
+        ProfileDetails details;
+        quint64 serial;
+        bool expired = false;
+    };
+
     void setState(ConnectionState state);
     void closeTransport();
     void fail(const QString &message, bool retryable);
@@ -51,6 +60,8 @@ private:
     void finishRegistration();
     void clearSecret();
     void checkKeepalive();
+    void queryPresence();
+    void clearPresence();
 
     [[nodiscard]] bool writeLine(const QByteArray &line);
     [[nodiscard]] bool canUseTarget(const QString &target) const;
@@ -70,6 +81,9 @@ private:
     void handleMembership(const irc::IrcMessage &message);
     void handleNames(const irc::IrcMessage &message);
     void handleChannelList(const irc::IrcMessage &message);
+    bool handleWhois(const irc::IrcMessage &message, int numeric);
+    bool handleJoinFailure(const irc::IrcMessage &message, int numeric);
+    void handleIson(const QList<QByteArray> &parameters);
     void finishChannelList(irc::ChannelListStatus status);
     void publishMembers(const QString &key);
     void removeChannel(const QString &channel);
@@ -80,6 +94,7 @@ private:
     QSslSocket *socket_ = nullptr;
     QTimer registrationTimer_;
     QTimer keepaliveTimer_;
+    QTimer presenceTimer_;
     QTimer channelListTimeout_;
     QTimer channelListUpdates_;
     QElapsedTimer lastChannelListRequest_;
@@ -101,6 +116,12 @@ private:
     irc::CaseMapping caseMapping_ = irc::CaseMapping::Rfc1459;
     qsizetype ownSourceBytes_ = 0;
     QHash<QString, Channel> channels_;
+    QHash<QString, WhoisRequest> whoisRequests_;
+    quint64 whoisSerial_ = 0;
+    QHash<QString, Presence> presencePeers_;
+    QStringList presencePending_;
+    qsizetype nextPresencePeer_ = 0;
+    bool presenceUnavailable_ = false;
 
     QByteArray secret_;
     QHash<QByteArray, QByteArray> offeredCapabilities_;

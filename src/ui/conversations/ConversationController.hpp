@@ -9,6 +9,7 @@ class MessageManager;
 namespace phoschat::ui {
 
 class ConversationController final : public QObject {
+    Q_OBJECT
 public:
     ConversationController(ConversationId id, MessageManager &messages, QObject *parent = nullptr);
 
@@ -18,6 +19,14 @@ public:
     void setDraft(const QString &draft) { m_draft = draft; }
     bool canSend() const;
     bool send();
+    bool canSendFiles() const;
+    bool sendFile(const QString &path);
+    bool hasPagedHistory() const;
+    HistoryState historyState() const;
+    void requestOlderHistory();
+
+signals:
+    void historyStateChanged();
 
 private:
     ConversationId m_id;

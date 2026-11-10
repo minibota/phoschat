@@ -40,20 +40,27 @@ jobs:
         run: |
           ctest --preset debug -E '^phoschat[.]irc$'
           build/debug/test_irc parsesAndBoundsFrames foldsNamesAndStripsFormatting \
-            legacyPlaintextRegistration listsPublicChannels boundsChannelDirectory searchesCuratedDirectory
+            legacyPlaintextRegistration retrievesContactProfiles reportsChannelJoinResults \
+            confirmsServerEchoedMessages observesDirectPeerPresence listsPublicChannels \
+            boundsChannelDirectory searchesCuratedDirectory
       - run: cmake --preset release -DBUILD_TESTING=OFF -DPHOSCHAT_USE_KEYCHAIN=OFF
       - run: cmake --build --preset release --parallel 2
       - name: Check private build input validation
         if: runner.os == 'Linux'
         run: python3 tests/test_build_credentials.py
+      - name: Test optional Slack HTTPS service without real credentials
+        if: runner.os == 'Linux'
+        run: python3 -m unittest discover -s services/slack-oauth -v
       - name: Configure bundled identity with test-only values
         env:
           PHOSCHAT_TELEGRAM_API_ID: '12345'
           PHOSCHAT_TELEGRAM_API_HASH: '0123456789abcdef0123456789abcdef'
+          PHOSCHAT_SLACK_CLIENT_ID: '12345.67890'
+          PHOSCHAT_SLACK_OAUTH_ORIGIN: 'https://oauth.example.test'
         run: >-
           cmake -S . -B build/bundled -G Ninja -DCMAKE_BUILD_TYPE=Debug
           -DPHOSCHAT_USE_KEYCHAIN=OFF -DPHOSCHAT_REQUIRE_TELEGRAM_APP_CREDENTIALS=ON
       - name: Build bundled sign-in tests
-        run: cmake --build build/bundled --target test_telegram_credentials test_ui test_core test_account_overview test_irc_accounts --parallel 2
+        run: cmake --build build/bundled --target test_telegram_credentials test_ui test_core test_account_overview test_irc_accounts test_history_ui test_slack_onboarding --parallel 2
       - name: Test bundled sign-in without network accounts
-        run: ctest --test-dir build/bundled --output-on-failure -R '^phoschat[.](telegram_credentials|ui|core|account_overview|irc_accounts)$'
+        run: ctest --test-dir build/bundled --output-on-failure -R '^phoschat[.](telegram_credentials|ui|core|account_overview|irc_accounts|history_ui|slack_onboarding)$'

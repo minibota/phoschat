@@ -1,7 +1,10 @@
 #include "providers/slack/slack_provider.h"
+#include "providers/slack/slack_app_config.h"
 
 #include <QDateTime>
 #include <QDeadlineTimer>
+#include <QFile>
+#include <QFileInfo>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QMutex>
@@ -161,14 +164,17 @@ SlackProvider::SlackProvider(const Account &account, QObject *parent)
     , account_(account)
     , apiBase_(u"https://slack.com/api/"_s)
     , authorizationEndpoint_(u"https://slack.com/oauth/v2/authorize"_s)
+    , oauthOrigin_(account.providerId == bundledSlackClientId() ? bundledSlackOAuthOrigin() : QUrl {})
 {
-    for (auto *timer : { &listTimer_, &historyTimer_, &refreshTimer_, &authTimer_, &profileTimer_ })
+    for (auto *timer :
+        { &listTimer_, &historyTimer_, &refreshTimer_, &authTimer_, &profileTimer_, &presenceTimer_ })
         timer->setSingleShot(true);
     connect(&listTimer_, &QTimer::timeout, this, &SlackProvider::refreshConversations);
     connect(&historyTimer_, &QTimer::timeout, this, &SlackProvider::readHistory);
     connect(&refreshTimer_, &QTimer::timeout, this, &SlackProvider::refreshToken);
     connect(&authTimer_, &QTimer::timeout, this, &SlackProvider::validateToken);
     connect(&profileTimer_, &QTimer::timeout, this, &SlackProvider::readProfile);
+    connect(&presenceTimer_, &QTimer::timeout, this, &SlackProvider::readPresence);
     connect(&oauth_, &SlackOAuth::authorizationRequested, this, &IChatProvider::authorizationUrlRequested);
     connect(&oauth_, &SlackOAuth::authorized, this, &SlackProvider::exchangeCode);
     connect(&oauth_, &SlackOAuth::failed, this, [this](const QString &error) { fail(error); });
@@ -180,9 +186,13 @@ SlackProvider::SlackProvider(const Account &account, const TestEndpoints &endpoi
     if (validTestEndpoint(endpoints.apiBase) && validTestEndpoint(endpoints.authorize)) {
         apiBase_ = endpoints.apiBase;
         authorizationEndpoint_ = endpoints.authorize;
-        callbackPort_ = 0;
+        callbackPort_ = endpoints.callbackPort;
+        oauthOrigin_ = validTestEndpoint(endpoints.oauthOrigin)
+            ? endpoints.oauthOrigin.adjusted(QUrl::RemovePath)
+            : QUrl {};
         historyIntervalMs_ = std::max(1, endpoints.historyIntervalMs);
         listPageIntervalMs_ = std::max(1, endpoints.pageIntervalMs);
+        presenceIntervalMs_ = std::max(1, endpoints.presenceIntervalMs);
         network_.setProxy(QNetworkProxy(QNetworkProxy::NoProxy));
     }
 }
@@ -190,7 +200,7 @@ SlackProvider::SlackProvider(const Account &account, const TestEndpoints &endpoi
 Capabilities SlackProvider::capabilities() const
 {
     return Capability::Text | Capability::DirectMessages | Capability::Groups | Capability::Channels
-        | Capability::RemoteHistory;
+        | Capability::RemoteHistory | Capability::Files | Capability::Presence;
 }
 
 void SlackProvider::connectAccount(const QByteArray &secret)
@@ -239,7 +249,8 @@ void SlackProvider::reset()
 {
     ++generation_;
     oauth_.stop();
-    for (auto *timer : { &listTimer_, &historyTimer_, &refreshTimer_, &authTimer_, &profileTimer_ })
+    for (auto *timer :
+        { &listTimer_, &historyTimer_, &refreshTimer_, &authTimer_, &profileTimer_, &presenceTimer_ })
         timer->stop();
     const auto previous = std::exchange(replies_, {});
     for (auto *reply : previous)
@@ -252,11 +263,21 @@ void SlackProvider::reset()
     refreshDeferred_ = false;
     historyInFlight_ = false;
     profileInFlight_ = false;
+    uploadInFlight_ = false;
+    presenceInFlight_ = false;
+    presenceUnavailable_ = false;
+    presenceByChannel_.clear();
+    nextPresenceCheck_.clear();
     nextListCursor_.clear();
     listed_.clear();
     channels_.clear();
     directPeers_.clear();
     profiles_.clear();
+    profileDetails_.clear();
+    conversationDetails_.clear();
+    requestedProfiles_.clear();
+    grantedScopes_.reset();
+    activeProfile_.clear();
     pendingProfiles_.clear();
     histories_.clear();
     sending_.clear();
@@ -296,6 +317,13 @@ bool SlackProvider::restoreCredentials(const QByteArray &secret)
     parsed.expiresAtMs = stored.value(u"expires_at_ms"_s).toInteger();
     parsed.workspace = stored.value(u"workspace"_s).toString();
     parsed.user = stored.value(u"user"_s).toString();
+    const auto storedOrigin = stored.value(u"oauth_origin"_s);
+    if (!storedOrigin.isUndefined() && !storedOrigin.isString())
+        return false;
+    parsed.oauthOrigin = QUrl(storedOrigin.toString());
+    if (!storedOrigin.toString().isEmpty()
+        && (!parsed.oauthOrigin.isValid() || parsed.oauthOrigin != oauthOrigin_))
+        return false;
     if (!validUserToken(parsed.access) || !validId(parsed.workspace, u"T") || !validId(parsed.user, u"UW")
         || (!parsed.refresh.isEmpty()
             && (!validClientId(account_.providerId) || !validRefreshToken(parsed.refresh)))
@@ -309,16 +337,14 @@ bool SlackProvider::restoreCredentials(const QByteArray &secret)
 void SlackProvider::publishCredentials()
 {
     credentialsDirty_ = false;
-    const auto stored = QJsonDocument(QJsonObject {
-                                          { u"format"_s, u"phoschat-slack-v1"_s },
-                                          { u"access"_s, QString::fromLatin1(credentials_.access) },
-                                          { u"refresh"_s, QString::fromLatin1(credentials_.refresh) },
-                                          { u"expires_at_ms"_s, credentials_.expiresAtMs },
-                                          { u"workspace"_s, credentials_.workspace },
-                                          { u"user"_s, credentials_.user },
-                                      })
-                            .toJson(QJsonDocument::Compact);
-    emit credentialsUpdated(stored);
+    QJsonObject stored { { u"format"_s, u"phoschat-slack-v1"_s },
+        { u"access"_s, QString::fromLatin1(credentials_.access) },
+        { u"refresh"_s, QString::fromLatin1(credentials_.refresh) },
+        { u"expires_at_ms"_s, credentials_.expiresAtMs }, { u"workspace"_s, credentials_.workspace },
+        { u"user"_s, credentials_.user } };
+    if (!credentials_.oauthOrigin.isEmpty())
+        stored.insert(u"oauth_origin"_s, credentials_.oauthOrigin.toString());
+    emit credentialsUpdated(QJsonDocument(stored).toJson(QJsonDocument::Compact));
 }
 
 void SlackProvider::authorize()
@@ -328,7 +354,7 @@ void SlackProvider::authorize()
         return;
     }
     setState(ConnectionState::Authenticating);
-    if (!oauth_.start(account_.providerId, callbackPort_, authorizationEndpoint_))
+    if (!oauth_.start(account_.providerId, callbackPort_, authorizationEndpoint_, oauthOrigin_))
         fail(tr("PhosChat could not listen on the Slack authorization callback port. Close the other "
                 "authorization and retry."));
 }
@@ -341,15 +367,20 @@ void SlackProvider::exchangeCode(const QString &code, const QString &verifier, c
         { u"code_verifier"_s, verifier },
         { u"redirect_uri"_s, redirect.toString() },
     };
-    request(u"oauth.v2.access"_s, {}, formBody(fields), FormContent, false, [this](const Result &result) {
-        if (!result.ok() || !updateCredentials(result.data, true)) {
-            fail(tr("Slack could not exchange the authorization code for a user session. Check your app "
-                    "settings and try again."));
-            return;
-        }
-        credentialsDirty_ = true;
-        validateToken();
-    });
+    const bool publicCallback
+        = !oauthOrigin_.isEmpty() && redirect.adjusted(QUrl::RemovePath) == oauthOrigin_;
+    request(u"oauth.v2.access"_s, {}, formBody(fields), FormContent, false,
+        [this, publicCallback](const Result &result) {
+            if (!result.ok() || !updateCredentials(result.data, true)) {
+                fail(tr("Slack could not exchange the authorization code for a user session. Check your app "
+                        "settings and try again."));
+                return;
+            }
+            if (publicCallback && !credentials_.refresh.isEmpty())
+                credentials_.oauthOrigin = oauthOrigin_;
+            credentialsDirty_ = true;
+            validateToken();
+        });
 }
 
 bool SlackProvider::updateCredentials(const QJsonObject &response, bool exchange)
@@ -386,6 +417,8 @@ bool SlackProvider::updateCredentials(const QJsonObject &response, bool exchange
     credentials_.access = token;
     credentials_.refresh = refresh;
     credentials_.expiresAtMs = expiresIn ? QDateTime::currentMSecsSinceEpoch() + expiresIn * 1000 : 0;
+    if (grant.contains(u"scope"_s))
+        rememberScopes(grant.value(u"scope"_s).toString());
     return true;
 }
 
@@ -404,7 +437,12 @@ void SlackProvider::refreshToken()
         { u"client_id"_s, account_.providerId },
         { u"refresh_token"_s, QString::fromLatin1(credentials_.refresh) },
     };
-    request(u"oauth.v2.access"_s, {}, formBody(fields), FormContent, false, [this](const Result &result) {
+    // A saved grant stays on the refresh route it was issued for. Loopback grants
+    // refresh directly with Slack, even in a build that also has a public callback.
+    const auto refreshUrl = credentials_.oauthOrigin.isEmpty()
+        ? apiBase_.resolved(QUrl(u"oauth.v2.access"_s))
+        : oauthOrigin_.resolved(QUrl(u"/phoschat/slack/refresh"_s));
+    requestAt(refreshUrl, formBody(fields), FormContent, false, [this](const Result &result) {
         refreshing_ = false;
         if (result.retryAfterMs || result.retryable) {
             refreshDeferred_ = true;
@@ -563,6 +601,17 @@ void SlackProvider::refreshConversations()
                 name.prepend(u'#');
             }
             value.title = name.isEmpty() ? channel : name;
+            ProfileDetails information { { tr("Conversation"), value.title },
+                { tr("Workspace ID"), credentials_.workspace }, { tr("Conversation ID"), channel } };
+            for (const auto &field : { u"topic"_s, u"purpose"_s }) {
+                const auto content = details.value(field).toObject().value(u"value"_s).toString().left(4096);
+                if (!content.isEmpty())
+                    information.append({ field == u"topic"_s ? tr("Topic") : tr("Purpose"), content });
+            }
+            if (details.contains(u"num_members"_s))
+                information.append(
+                    { tr("Members"), QString::number(details.value(u"num_members"_s).toInt()) });
+            conversationDetails_.insert(channel, information);
             if (!channels_.contains(channel) || channels_.value(channel).title != value.title
                 || channels_.value(channel).kind != value.kind) {
                 channels_.insert(channel, value);
@@ -582,12 +631,18 @@ void SlackProvider::refreshConversations()
                     auto value = channels_.take(channel);
                     value.joined = false;
                     directPeers_.remove(channel);
+                    publishPresence(channel, Presence::Unknown);
+                    nextPresenceCheck_.remove(channel);
+                    conversationDetails_.remove(channel);
+                    requestedProfiles_.remove(channel);
                     histories_.remove(channel);
                     emit conversationChanged(value);
                 }
             }
             listTimer_.start(ListRefreshMs);
         }
+        if (!openConversations_.isEmpty() && !presenceInFlight_)
+            presenceTimer_.start(0);
         if (!selected_.isEmpty() && !historyTimer_.isActive() && !historyInFlight_)
             historyTimer_.start(0);
     });
@@ -673,6 +728,97 @@ void SlackProvider::readHistory()
         });
 }
 
+void SlackProvider::setConversationOpen(const ConversationId &id, bool open)
+{
+    if (id.accountId != account_.id || id.remoteId.isEmpty())
+        return;
+    if (open) {
+        openConversations_.insert(id.remoteId);
+    } else {
+        openConversations_.remove(id.remoteId);
+        const auto channel = remoteChannel(id);
+        if (!channel.isEmpty()) {
+            nextPresenceCheck_.remove(channel);
+            publishPresence(channel, Presence::Unknown);
+        }
+    }
+    if (!presenceInFlight_)
+        presenceTimer_.start(0);
+}
+
+void SlackProvider::publishPresence(const QString &channel, Presence presence)
+{
+    if (presenceByChannel_.value(channel, Presence::Unknown) == presence)
+        return;
+    presenceByChannel_.insert(channel, presence);
+    emit presenceChanged(conversationId(channel), presence);
+}
+
+void SlackProvider::readPresence()
+{
+    if (state_ != ConnectionState::Connected || presenceInFlight_)
+        return;
+    if (presenceUnavailable_ || (grantedScopes_ && !grantedScopes_->contains(u"users:read"_s))) {
+        for (const auto &channel : presenceByChannel_.keys())
+            publishPresence(channel, Presence::Unknown);
+        return;
+    }
+
+    const auto now = QDeadlineTimer::current(Qt::PreciseTimer).deadline();
+    QString channel;
+    qint64 earliest = std::numeric_limits<qint64>::max();
+    for (const auto &remoteId : openConversations_) {
+        const auto candidate = remoteChannel({ account_.id, remoteId });
+        if (candidate.isEmpty() || !directPeers_.contains(candidate))
+            continue;
+        const auto due = nextPresenceCheck_.value(candidate);
+        if (due < earliest) {
+            channel = candidate;
+            earliest = due;
+        }
+    }
+    if (channel.isEmpty())
+        return;
+    if (earliest > now) {
+        presenceTimer_.start(
+            static_cast<int>(std::min<qint64>(earliest - now, std::numeric_limits<int>::max())));
+        return;
+    }
+    const auto key = apiBase_.authority() + u'/' + credentials_.workspace + u"/users.getPresence"_s;
+    // Tier 3 is shared across a workspace; do not poll the entire contact list.
+    if (const int wait = quota.reserve(key, 1300)) {
+        presenceTimer_.start(wait);
+        return;
+    }
+    presenceInFlight_ = true;
+    const auto user = directPeers_.value(channel);
+    request(u"users.getPresence"_s, { { u"user"_s, user } }, std::nullopt, {}, true,
+        [this, channel, user, key](const Result &result) {
+            presenceInFlight_ = false;
+            const auto now = QDeadlineTimer::current(Qt::PreciseTimer).deadline();
+            nextPresenceCheck_.insert(channel, now + std::max(presenceIntervalMs_, result.retryAfterMs));
+            if (result.retryAfterMs)
+                quota.backOff(key, result.retryAfterMs);
+            if (result.error == u"missing_scope"_s || result.error == u"not_allowed_token_type"_s)
+                presenceUnavailable_ = true;
+            if (handleSessionError(result)) {
+                if (state_ == ConnectionState::Connected)
+                    presenceTimer_.start(presenceIntervalMs_);
+                return;
+            }
+            if (openConversations_.contains(conversationId(channel).remoteId)
+                && directPeers_.value(channel) == user && channels_.contains(channel)) {
+                const auto remote = result.data.value(u"presence"_s).toString();
+                const auto presence = !result.ok() ? Presence::Unknown
+                    : remote == u"active"_s        ? Presence::Online
+                    : remote == u"away"_s          ? Presence::Away
+                                                   : Presence::Unknown;
+                publishPresence(channel, presence);
+            }
+            presenceTimer_.start(0);
+        });
+}
+
 void SlackProvider::queueProfile(const QString &id)
 {
     if (!validId(id, u"UW") || profiles_.contains(id) || pendingProfiles_.contains(id)
@@ -693,11 +839,13 @@ void SlackProvider::readProfile()
         return;
     }
     const auto user = pendingProfiles_.takeFirst();
+    activeProfile_ = user;
     profiles_.insert(user, user);
     profileInFlight_ = true;
     request(u"users.info"_s, { { u"user"_s, user } }, std::nullopt, {}, true,
         [this, key, user](const Result &result) {
             profileInFlight_ = false;
+            activeProfile_.clear();
             if (result.retryAfterMs) {
                 quota.backOff(key, result.retryAfterMs);
                 pendingProfiles_.prepend(user);
@@ -710,6 +858,23 @@ void SlackProvider::readProfile()
                 if (name.isEmpty())
                     name = details.value(u"name"_s).toString().trimmed().left(256);
                 profiles_.insert(user, name.isEmpty() ? user : name);
+                ProfileDetails information { { tr("User ID"), user },
+                    { tr("Workspace ID"), credentials_.workspace } };
+                const QList<QPair<QString, QString>> fields { { u"display_name"_s, tr("Display name") },
+                    { u"real_name"_s, tr("Full name") }, { u"title"_s, tr("Title") },
+                    { u"status_text"_s, tr("Status") }, { u"email"_s, tr("Email") },
+                    { u"phone"_s, tr("Phone") } };
+                for (const auto &[field, label] : fields) {
+                    const auto value = profile.value(field).toString().trimmed().left(4096);
+                    if (!value.isEmpty())
+                        information.append({ label, value });
+                }
+                if (!details.value(u"name"_s).toString().isEmpty())
+                    information.append({ tr("Username"), details.value(u"name"_s).toString().left(256) });
+                if (!details.value(u"tz_label"_s).toString().isEmpty())
+                    information.append(
+                        { tr("Time zone"), details.value(u"tz_label"_s).toString().left(256) });
+                profileDetails_.insert(user, information);
                 for (auto it = directPeers_.cbegin(); it != directPeers_.cend(); ++it) {
                     if (it.value() != user || !channels_.contains(it.key()) || name.isEmpty())
                         continue;
@@ -720,10 +885,53 @@ void SlackProvider::readProfile()
             } else {
                 // A failed name lookup must not prevent messaging or cause continuous retries.
                 profiles_.insert(user, user);
+                profileDetails_.insert(user,
+                    { { tr("User ID"), user },
+                        { tr("Profile"),
+                            result.error == u"missing_scope"_s
+                                ? tr("Authorize this Slack app with users:read to view profiles.")
+                                : tr("Slack could not provide this profile.") } });
+            }
+            if (!result.retryAfterMs) {
+                const auto requested = requestedProfiles_.values();
+                for (const auto &channel : requested) {
+                    if (directPeers_.value(channel) == user && channels_.contains(channel)) {
+                        requestedProfiles_.remove(channel);
+                        emit profileReceived(conversationId(channel), profileDetails_.value(user));
+                    }
+                }
             }
             if (!pendingProfiles_.isEmpty())
                 profileTimer_.start(result.retryAfterMs ? result.retryAfterMs : 0);
         });
+}
+
+bool SlackProvider::requestProfile(const ConversationId &id)
+{
+    const auto channel = remoteChannel(id);
+    if (state_ != ConnectionState::Connected || channel.isEmpty())
+        return false;
+    const auto user = directPeers_.value(channel);
+    if (user.isEmpty()) {
+        emit profileReceived(id, conversationDetails_.value(channel));
+    } else if (profileDetails_.contains(user)) {
+        emit profileReceived(id, profileDetails_.value(user));
+    } else {
+        requestedProfiles_.insert(channel);
+        if (activeProfile_ != user && !pendingProfiles_.contains(user))
+            pendingProfiles_.prepend(user);
+        if (!profileTimer_.isActive() && !profileInFlight_)
+            profileTimer_.start(0);
+    }
+    return true;
+}
+
+void SlackProvider::rememberScopes(const QString &scopes)
+{
+    QSet<QString> granted;
+    for (const auto &scope : scopes.split(u',', Qt::SkipEmptyParts))
+        granted.insert(scope.trimmed());
+    grantedScopes_ = std::move(granted);
 }
 
 void SlackProvider::emitText(
@@ -731,7 +939,17 @@ void SlackProvider::emitText(
 {
     if (!channels_.contains(channel))
         return;
-    const auto text = object.value(u"text"_s).toString();
+    auto text = object.value(u"text"_s).toString();
+    const auto files = object.value(u"files"_s).toArray();
+    for (const auto &entry : files) {
+        const auto file = entry.toObject();
+        auto name = file.value(u"title"_s).toString(file.value(u"name"_s).toString()).left(256);
+        if (name.isEmpty())
+            name = tr("Attachment");
+        if (!text.isEmpty())
+            text += u'\n';
+        text += tr("File: %1").arg(slackPlainInput(name));
+    }
     const auto timestamp = object.value(u"ts"_s).toString();
     const auto micros = timestampValue(timestamp);
     const auto type = object.value(u"type"_s).toString();
@@ -756,6 +974,7 @@ void SlackProvider::emitText(
     message.outgoing = outgoing || user == credentials_.user;
     message.mention = text.contains(u"<@"_s + credentials_.user + u'>');
     message.historical = historical;
+    message.delivery = message.outgoing ? DeliveryState::Sent : DeliveryState::None;
     emit messageReceived(message);
 }
 
@@ -803,13 +1022,163 @@ bool SlackProvider::sendText(const ConversationId &id, const QString &text)
     return true;
 }
 
+bool SlackProvider::canSendFiles(const ConversationId &id) const
+{
+    return state_ == ConnectionState::Connected && !remoteChannel(id).isEmpty()
+        && (!grantedScopes_ || grantedScopes_->contains(u"files:write"_s));
+}
+
+bool SlackProvider::sendFile(const ConversationId &id, const QString &path)
+{
+    const auto channel = remoteChannel(id);
+    if (state_ != ConnectionState::Connected || channel.isEmpty())
+        return false;
+    if (grantedScopes_ && !grantedScopes_->contains(u"files:write"_s)) {
+        emit notice(tr("Sending files requires Slack's files:write permission. Authorize the app again "
+                       "with that permission, or reconnect using an updated user token."));
+        return false;
+    }
+    if (uploadInFlight_) {
+        emit notice(tr("Wait for the current Slack file upload to finish."));
+        return false;
+    }
+    const QFileInfo information(path);
+    auto file = std::make_shared<QFile>(path);
+    if (!information.isFile() || !file->open(QIODevice::ReadOnly) || file->size() <= 0
+        || file->size() > 512LL * 1024 * 1024) {
+        emit notice(tr("Choose a readable, non-empty file of up to 512 MiB for Slack."));
+        return false;
+    }
+    const auto key = apiBase_.authority() + u'/' + credentials_.workspace + u"/files.getUploadURLExternal"_s;
+    if (quota.reserve(key, 650)) {
+        emit notice(tr("Slack is limiting file uploads. Wait before trying again."));
+        return false;
+    }
+    uploadInFlight_ = true;
+    const auto name = information.fileName().left(255);
+    const QUrlQuery fields { { u"filename"_s, name }, { u"length"_s, QString::number(file->size()) } };
+    request(u"files.getUploadURLExternal"_s, {}, formBody(fields), FormContent, true,
+        [this, channel, name, file, key](const Result &result) {
+            if (!result.ok()) {
+                if (result.retryAfterMs)
+                    quota.backOff(key, result.retryAfterMs);
+                fileFailed(result);
+                return;
+            }
+            const QUrl url(result.data.value(u"upload_url"_s).toString());
+            const auto fileId = result.data.value(u"file_id"_s).toString();
+            const bool productionUrl = url.scheme() == u"https"_s && url.host() == u"files.slack.com"_s
+                && (url.port() == -1 || url.port() == 443) && url.path().startsWith(u"/upload/"_s);
+            const bool testUrl = validTestEndpoint(apiBase_) && url.scheme() == apiBase_.scheme()
+                && url.host() == apiBase_.host() && url.port() == apiBase_.port();
+            if (!url.isValid() || !url.userInfo().isEmpty() || url.hasFragment()
+                || (!productionUrl && !testUrl) || !validId(fileId, u"F")) {
+                fileFailed({ {}, u"invalid_response"_s });
+                return;
+            }
+            uploadFile(channel, fileId, name, url, file);
+        });
+    return true;
+}
+
+void SlackProvider::uploadFile(const QString &channel, const QString &fileId, const QString &name,
+    const QUrl &url, const std::shared_ptr<QFile> &file)
+{
+    // Slack's signed upload URL is sufficient: never forward the Web API bearer token or follow redirects.
+    QNetworkRequest request(url);
+    request.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::ManualRedirectPolicy);
+    request.setAttribute(QNetworkRequest::DoNotBufferUploadDataAttribute, true);
+    request.setAttribute(QNetworkRequest::CookieLoadControlAttribute, QNetworkRequest::Manual);
+    request.setAttribute(QNetworkRequest::CookieSaveControlAttribute, QNetworkRequest::Manual);
+    request.setTransferTimeout(120000);
+    request.setHeader(QNetworkRequest::ContentTypeHeader, u"application/octet-stream"_s);
+    request.setHeader(QNetworkRequest::ContentLengthHeader, file->size());
+    auto *reply = network_.post(request, file.get());
+    reply->setReadBufferSize(65537);
+    replies_.insert(reply);
+    const unsigned generation = generation_;
+    auto received = std::make_shared<qint64>(0);
+    connect(reply, &QNetworkReply::readyRead, this, [reply, received] {
+        *received += reply->read(65537).size();
+        if (*received > 65536)
+            reply->abort();
+    });
+    connect(reply, &QNetworkReply::finished, this,
+        [this, reply, generation, received, file, channel, fileId, name] {
+            replies_.remove(reply);
+            reply->deleteLater();
+            file->close();
+            if (generation != generation_)
+                return;
+            if (reply->isReadable())
+                *received += reply->read(65537).size();
+            if (reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt() != 200
+                || reply->error() != QNetworkReply::NoError || *received > 65536) {
+                fileFailed({ {}, u"upload_failed"_s });
+                return;
+            }
+            finishFile(channel, fileId, name);
+        });
+}
+
+void SlackProvider::finishFile(const QString &channel, const QString &fileId, const QString &name)
+{
+    const QJsonArray files { QJsonObject { { u"id"_s, fileId }, { u"title"_s, name } } };
+    const QUrlQuery fields { { u"channel_id"_s, channel },
+        { u"files"_s, QString::fromUtf8(QJsonDocument(files).toJson(QJsonDocument::Compact)) } };
+    request(u"files.completeUploadExternal"_s, {}, formBody(fields), FormContent, true,
+        [this, channel, fileId](const Result &result) {
+            if (!result.ok()) {
+                fileFailed(result);
+                return;
+            }
+            const auto files = result.data.value(u"files"_s).toArray();
+            const bool confirmed = std::ranges::any_of(files, [&fileId](const QJsonValue &file) {
+                return file.toObject().value(u"id"_s).toString() == fileId;
+            });
+            if (!confirmed) {
+                fileFailed({ {}, u"invalid_response"_s });
+                return;
+            }
+            uploadInFlight_ = false;
+            emit notice(tr("File sent to Slack."));
+            // completeUploadExternal need not return a message timestamp. Let history supply the actual
+            // message identity instead of creating a local echo that later duplicates the file share.
+            if (selected_.isEmpty() || selected_ == channel)
+                requestHistory(conversationId(channel));
+        });
+}
+
+void SlackProvider::fileFailed(const Result &result)
+{
+    uploadInFlight_ = false;
+    if (result.error == u"missing_scope"_s) {
+        emit notice(tr("Sending files requires Slack's files:write permission. Authorize the app again "
+                       "with that permission, or reconnect using an updated user token."));
+    } else if (result.retryAfterMs) {
+        emit notice(tr("Slack is limiting file uploads. Wait before retrying and check the conversation "
+                       "first to avoid sending a duplicate."));
+    } else if (!handleSessionError(result)) {
+        emit notice(tr("Slack could not confirm the file upload. Check the conversation before retrying; "
+                       "your workspace may restrict this file type or size."));
+    }
+}
+
 void SlackProvider::request(const QString &method, const QUrlQuery &query, std::optional<QByteArray> body,
     const QByteArray &contentType, bool authenticated, Finished finished)
 {
     QUrl url = apiBase_.resolved(QUrl(method));
     url.setQuery(query);
+    requestAt(url, std::move(body), contentType, authenticated, std::move(finished));
+}
+
+void SlackProvider::requestAt(const QUrl &url, std::optional<QByteArray> body, const QByteArray &contentType,
+    bool authenticated, Finished finished)
+{
     QNetworkRequest request(url);
     request.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::ManualRedirectPolicy);
+    request.setAttribute(QNetworkRequest::CookieLoadControlAttribute, QNetworkRequest::Manual);
+    request.setAttribute(QNetworkRequest::CookieSaveControlAttribute, QNetworkRequest::Manual);
     request.setTransferTimeout(15000);
     request.setRawHeader("Accept", "application/json");
     if (authenticated)
@@ -832,7 +1201,7 @@ void SlackProvider::request(const QString &method, const QUrlQuery &query, std::
             reply->abort();
     });
     connect(reply, &QNetworkReply::finished, this,
-        [this, reply, bytes, generation, finished = std::move(finished)] {
+        [this, reply, bytes, generation, authenticated, finished = std::move(finished)] {
             replies_.remove(reply);
             reply->deleteLater();
             if (generation != generation_)
@@ -842,6 +1211,8 @@ void SlackProvider::request(const QString &method, const QUrlQuery &query, std::
 
             Result result;
             const auto status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+            if (authenticated && status >= 200 && status < 300 && reply->hasRawHeader("X-OAuth-Scopes"))
+                rememberScopes(QString::fromLatin1(reply->rawHeader("X-OAuth-Scopes")));
             if (status == 429) {
                 bool valid = false;
                 const auto seconds = reply->rawHeader("Retry-After").toLongLong(&valid);

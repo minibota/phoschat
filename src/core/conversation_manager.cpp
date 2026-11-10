@@ -4,6 +4,7 @@
 #include "storage/database.h"
 
 #include <QRegularExpression>
+#include <QTimer>
 
 namespace phoschat {
 
@@ -18,6 +19,22 @@ ConversationManager::ConversationManager(AccountManager &accounts, Database &dat
     }
     connect(&accounts_, &AccountManager::conversationChanged, this,
         &ConversationManager::acceptRemoteConversation);
+    connect(&accounts_, &AccountManager::presenceChanged, this,
+        [this](const ConversationId &id, Presence presence) {
+            if (accounts_.state(id.accountId) != ConnectionState::Connected)
+                return;
+            const auto conversation = conversations_.find(id);
+            if (conversation != conversations_.end() && conversation->kind == ConversationKind::Direct
+                && conversation->presence != presence) {
+                conversation->presence = presence;
+                emit conversationsChanged();
+            }
+        });
+    connect(&accounts_, &AccountManager::joinFailed, this,
+        [this](const ConversationId &id, const QString &detail) {
+            pendingJoins_.remove(id);
+            emit errorOccurred(detail);
+        });
     connect(&accounts_, &AccountManager::membersChanged, this,
         [this](const ConversationId &id, const QStringList &names) {
             if (!conversations_.contains(id))
@@ -53,14 +70,31 @@ bool ConversationManager::joinChannel(const QString &accountId, const QString &t
     }
     const QString name = target.trimmed();
     const ConversationId id { accountId, provider->canonicalTarget(name) };
+    if (!id.isValid())
+        return false;
     if (auto value = conversation(id); value && value->joined) {
         value->autoJoin = true;
-        return save(*value);
+        if (!save(*value))
+            return false;
+        emit channelJoined(id);
+        return true;
     }
-    pendingJoins_.insert(id);
+    if (pendingJoins_.contains(id))
+        return true;
+    const auto attempt = ++nextJoinAttempt_;
+    pendingJoins_.insert(id, attempt);
     if (!provider->join(name)) {
         pendingJoins_.remove(id);
         return false;
+    }
+    if (pendingJoins_.value(id) == attempt) {
+        emit channelJoinStarted(name);
+        QTimer::singleShot(12000, this, [this, id, name, attempt] {
+            if (pendingJoins_.value(id) == attempt) {
+                pendingJoins_.remove(id);
+                emit errorOccurred(tr("The IRC server did not confirm joining %1. Try again.").arg(name));
+            }
+        });
     }
     return true;
 }
@@ -145,17 +179,27 @@ void ConversationManager::acceptRemoteConversation(const Conversation &remote)
     const auto existing = conversation(remote.id);
     const bool confirmedJoin = remote.joined && pendingJoins_.remove(remote.id);
     if (existing && existing->title == remote.title && existing->kind == remote.kind
-        && existing->joined == remote.joined && !confirmedJoin)
+        && existing->joined == remote.joined && !confirmedJoin) {
+        if (existing->avatar != remote.avatar) {
+            auto &value = conversations_[remote.id];
+            value.avatar = remote.avatar;
+            emit conversationsChanged();
+        }
         return;
+    }
     Conversation value = existing.value_or(remote);
     value.title = remote.title;
     value.kind = remote.kind;
     value.joined = remote.joined;
+    value.avatar = remote.avatar;
+    if (!existing || value.kind != ConversationKind::Direct)
+        value.presence = Presence::Unknown;
     if (confirmedJoin)
         value.autoJoin = true;
     if (!value.joined && members_.remove(value.id))
         emit membersChanged(value.id);
-    save(value);
+    if (save(value) && confirmedJoin)
+        emit channelJoined(value.id);
 }
 
 bool ConversationManager::save(const Conversation &value)
@@ -171,6 +215,7 @@ bool ConversationManager::save(const Conversation &value)
 
 void ConversationManager::dropAccount(const QString &accountId)
 {
+    pendingJoins_.removeIf([&](auto it) { return it.key().accountId == accountId; });
     conversations_.removeIf([&](auto it) { return it.key().accountId == accountId; });
     members_.removeIf([&](auto it) { return it.key().accountId == accountId; });
     emit conversationsChanged();
@@ -178,13 +223,17 @@ void ConversationManager::dropAccount(const QString &accountId)
 
 void ConversationManager::clearMembership(const QString &accountId)
 {
-    pendingJoins_.removeIf([&](const ConversationId &id) { return id.accountId == accountId; });
+    pendingJoins_.removeIf([&](auto it) { return it.key().accountId == accountId; });
     bool changed = false;
     for (auto it = conversations_.begin(); it != conversations_.end(); ++it) {
         if (it.key().accountId != accountId)
             continue;
         if (it->joined) {
             it->joined = false;
+            changed = true;
+        }
+        if (it->presence != Presence::Unknown) {
+            it->presence = Presence::Unknown;
             changed = true;
         }
         if (members_.remove(it.key()))

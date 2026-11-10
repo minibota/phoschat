@@ -4,12 +4,16 @@
 #include "core/conversation_manager.h"
 #include "storage/database.h"
 
+#include <QFileInfo>
 #include <QUuid>
 
 #include <algorithm>
 #include <limits>
 
 namespace phoschat {
+namespace {
+    constexpr int RecentHistoryLimit = 200;
+}
 
 MessageManager::MessageManager(
     AccountManager &accounts, ConversationManager &conversations, Database &database, QObject *parent)
@@ -20,6 +24,12 @@ MessageManager::MessageManager(
 {
     connect(&accounts_, &AccountManager::messageReceived, this, &MessageManager::receive);
     connect(&accounts_, &AccountManager::messageRemoved, this, &MessageManager::removeMessage);
+    connect(&accounts_, &AccountManager::messagesReadThrough, this, &MessageManager::markReadThrough);
+    connect(&accounts_, &AccountManager::historyStateChanged, this, &MessageManager::historyStateChanged);
+    connect(&accounts_, &AccountManager::historyCleared, this, [this](const ConversationId &id) {
+        sessionHistory_.remove(id);
+        emit historyCleared(id);
+    });
     connect(&accounts_, &AccountManager::accountStateChanged, this,
         [this](const QString &id, ConnectionState state) {
             if (state != ConnectionState::Disconnected || accounts_.protocol(id) == Protocol::Irc)
@@ -31,10 +41,14 @@ MessageManager::MessageManager(
 
 QList<Message> MessageManager::history(const ConversationId &id, int limit)
 {
-    if (accounts_.protocol(id.accountId) == Protocol::Irc)
-        return database_.messages(id, limit);
+    const auto protocol = accounts_.protocol(id.accountId);
+    const int count = limit < 0 ? RecentHistoryLimit : limit;
+    if (protocol == Protocol::Irc)
+        return database_.messages(id, count);
     const auto items = sessionHistory_.value(id);
-    return items.last(std::clamp<qsizetype>(limit, 0, items.size()));
+    if (protocol == Protocol::Telegram && limit < 0)
+        return items;
+    return items.last(std::min<qsizetype>(count, items.size()));
 }
 
 void MessageManager::requestHistory(const ConversationId &id)
@@ -42,6 +56,32 @@ void MessageManager::requestHistory(const ConversationId &id)
     if (auto *provider = accounts_.provider(id.accountId);
         provider && provider->capabilities().testFlag(Capability::RemoteHistory))
         provider->requestHistory(id);
+}
+
+bool MessageManager::hasPagedHistory(const ConversationId &id) const
+{
+    if (const auto *provider = accounts_.provider(id.accountId))
+        return provider->capabilities().testFlag(Capability::PaginatedHistory);
+    return accounts_.protocol(id.accountId) == Protocol::Telegram;
+}
+
+HistoryState MessageManager::historyState(const ConversationId &id) const
+{
+    if (const auto *provider = accounts_.provider(id.accountId))
+        return provider->historyState(id);
+    return HistoryState::Unavailable;
+}
+
+void MessageManager::requestOlderHistory(const ConversationId &id)
+{
+    if (auto *provider = accounts_.provider(id.accountId))
+        provider->requestOlderHistory(id);
+}
+
+void MessageManager::setConversationOpen(const ConversationId &id, bool open)
+{
+    if (auto *provider = accounts_.provider(id.accountId))
+        provider->setConversationOpen(id, open);
 }
 
 bool MessageManager::canSend(const ConversationId &id) const
@@ -52,6 +92,21 @@ bool MessageManager::canSend(const ConversationId &id) const
     return value && provider && accounts_.state(id.accountId) == ConnectionState::Connected
         && provider->capabilities().testFlag(Capability::Text)
         && (value->joined || (irc && value->kind != ConversationKind::Channel));
+}
+
+bool MessageManager::canSendFiles(const ConversationId &id) const
+{
+    const auto *provider = accounts_.provider(id.accountId);
+    return provider && accounts_.state(id.accountId) == ConnectionState::Connected
+        && conversations_.conversation(id) && provider->canSendFiles(id);
+}
+
+bool MessageManager::sendFile(const ConversationId &id, const QString &path)
+{
+    const QFileInfo file(path);
+    if (!canSendFiles(id) || !file.isFile() || !file.isReadable() || file.size() <= 0)
+        return false;
+    return accounts_.provider(id.accountId)->sendFile(id, file.absoluteFilePath());
 }
 
 bool MessageManager::send(const ConversationId &id, const QString &text)
@@ -109,17 +164,19 @@ void MessageManager::receive(Message message)
         auto &items = sessionHistory_[id];
         const auto duplicate = std::ranges::find(items, message.id, &Message::id);
         if (duplicate != items.end()) {
-            if (duplicate->text != message.text) {
+            if (message.delivery == DeliveryState::None || duplicate->delivery == DeliveryState::Read)
+                message.delivery = duplicate->delivery;
+            if (duplicate->text != message.text || duplicate->delivery != message.delivery) {
                 message.historical = true;
                 duplicate->text = message.text;
+                duplicate->delivery = message.delivery;
                 emit messageAdded(message);
             }
             return;
         }
-        const auto position = std::upper_bound(items.begin(), items.end(), message.timestamp,
-            [](const QDateTime &time, const Message &entry) { return time < entry.timestamp; });
+        const auto position = std::upper_bound(items.cbegin(), items.cend(), message, messageBefore);
         items.insert(position, message);
-        if (items.size() > 200)
+        if (accounts_.protocol(id.accountId) != Protocol::Telegram && items.size() > RecentHistoryLimit)
             items.removeFirst();
         if (!message.historical)
             conversations_.save(*value);
@@ -137,6 +194,24 @@ void MessageManager::receive(Message message)
     conversations_.conversations_.insert(id, *value);
     emit messageAdded(message);
     emit conversations_.conversationsChanged();
+}
+
+void MessageManager::markReadThrough(const ConversationId &id, qint64 sequence)
+{
+    const auto entry = sessionHistory_.find(id);
+    if (entry == sessionHistory_.end() || sequence <= 0)
+        return;
+    QList<Message> changes;
+    for (auto &message : *entry) {
+        if (message.outgoing && message.sequence > 0 && message.sequence <= sequence
+            && message.delivery == DeliveryState::Sent) {
+            message.delivery = DeliveryState::Read;
+            auto &change = changes.emplaceBack(message);
+            change.historical = true;
+        }
+    }
+    for (const auto &message : changes)
+        emit messageAdded(message);
 }
 
 void MessageManager::removeMessage(const ConversationId &id, const QString &messageId)

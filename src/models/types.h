@@ -1,9 +1,12 @@
 #pragma once
 
+#include <QByteArray>
 #include <QDateTime>
 #include <QFlags>
 #include <QHashFunctions>
+#include <QList>
 #include <QMetaType>
+#include <QPair>
 #include <QString>
 #include <QStringList>
 
@@ -11,8 +14,12 @@ namespace phoschat {
 
 enum class Protocol { Irc = 0, Telegram = 1, Matrix = 2, Slack = 3 };
 enum class ConnectionState { Disconnected, Connecting, Authenticating, Connected, Reconnecting, Error };
+enum class Presence { Unknown, Online, Away, Offline };
 enum class ConversationKind { Channel = 0, Direct = 1, Group = 2 };
 enum class AuthenticationKind { Phone, Code, Password, EmailAddress, EmailCode, Registration, Unsupported };
+enum class HistoryState { Unavailable, Ready, Loading, Complete };
+enum class DeliveryState { None, Pending, Sent, Read, Failed };
+using ProfileDetails = QList<QPair<QString, QString>>;
 enum class Capability : unsigned {
     Text = 1u << 0,
     DirectMessages = 1u << 1,
@@ -27,7 +34,8 @@ enum class Capability : unsigned {
     RemoteHistory = 1u << 10,
     Typing = 1u << 11,
     ReadReceipts = 1u << 12,
-    E2ee = 1u << 13
+    E2ee = 1u << 13,
+    PaginatedHistory = 1u << 14
 };
 Q_DECLARE_FLAGS(Capabilities, Capability)
 
@@ -69,6 +77,8 @@ struct Conversation {
     QString group;
     int unread {};
     QDateTime updated;
+    QByteArray avatar;
+    Presence presence { Presence::Unknown };
 };
 
 struct Message {
@@ -80,12 +90,22 @@ struct Message {
     bool outgoing {};
     bool mention {};
     bool historical {};
+    qint64 sequence {};
+    DeliveryState delivery { DeliveryState::None };
 };
+
+inline bool messageBefore(const Message &first, const Message &second)
+{
+    if (first.timestamp != second.timestamp)
+        return first.timestamp < second.timestamp;
+    return first.sequence < second.sequence;
+}
 
 } // namespace phoschat
 
 Q_DECLARE_OPERATORS_FOR_FLAGS(phoschat::Capabilities)
 Q_DECLARE_METATYPE(phoschat::ConnectionState)
+Q_DECLARE_METATYPE(phoschat::Presence)
 Q_DECLARE_METATYPE(phoschat::AuthenticationKind)
 Q_DECLARE_METATYPE(phoschat::ConversationId)
 Q_DECLARE_METATYPE(phoschat::Conversation)

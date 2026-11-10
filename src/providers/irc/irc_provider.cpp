@@ -5,12 +5,18 @@
 #include <QSslSocket>
 #include <QUuid>
 
+#include <algorithm>
 #include <utility>
 
 namespace phoschat {
 namespace {
 
     constexpr qsizetype MaximumChannelListings = 20000;
+    constexpr qsizetype MaximumWhoisRequests = 32;
+    constexpr int PresenceIntervalMs = 30000;
+    constexpr qsizetype MaximumIsonPeers = 10;
+    // Leave room in the 512-byte reply for the server and recipient prefixes.
+    constexpr qsizetype MaximumIsonQueryBytes = 150;
 
     bool validToken(const QString &token)
     {
@@ -64,6 +70,8 @@ IrcProvider::IrcProvider(Account account, QSslConfiguration tlsConfiguration, QO
     });
     keepaliveTimer_.setInterval(15000);
     connect(&keepaliveTimer_, &QTimer::timeout, this, &IrcProvider::checkKeepalive);
+    presenceTimer_.setSingleShot(true);
+    connect(&presenceTimer_, &QTimer::timeout, this, &IrcProvider::queryPresence);
     channelListTimeout_.setSingleShot(true);
     channelListTimeout_.setInterval(20000);
     connect(&channelListTimeout_, &QTimer::timeout, this,
@@ -75,7 +83,7 @@ IrcProvider::IrcProvider(Account account, QSslConfiguration tlsConfiguration, QO
 
 Capabilities IrcProvider::capabilities() const
 {
-    return Capability::Text | Capability::DirectMessages | Capability::Channels;
+    return Capability::Text | Capability::DirectMessages | Capability::Channels | Capability::Presence;
 }
 
 void IrcProvider::connectAccount(const QByteArray &secret)
@@ -188,6 +196,11 @@ bool IrcProvider::join(const QString &target)
         emit notice(tr("Connect to IRC and enter a valid channel name."));
         return false;
     }
+    const auto existing = channels_.constFind(canonicalTarget(target));
+    if (existing != channels_.cend()) {
+        emit conversationChanged(makeConversation(existing->name, true));
+        return true;
+    }
     if (!writeLine("JOIN " + target.toUtf8())) {
         emit notice(tr("The IRC channel name could not be sent."));
         return false;
@@ -264,6 +277,62 @@ QString IrcProvider::canonicalTarget(const QString &target) const
     return irc::caseFold(target, caseMapping_);
 }
 
+bool IrcProvider::requestProfile(const ConversationId &id)
+{
+    const auto &nick = id.remoteId;
+    if (state_ != ConnectionState::Connected || id.accountId != account_.id || !canUseTarget(nick)
+        || isChannel(nick) || nick.toUtf8().size() > 100) {
+        return false;
+    }
+
+    const auto key = canonicalTarget(nick);
+    if (const auto request = whoisRequests_.constFind(key); request != whoisRequests_.cend()) {
+        return request->id == id && !request->expired;
+    }
+    if (whoisRequests_.size() >= MaximumWhoisRequests || !writeLine("WHOIS " + nick.toUtf8())) {
+        return false;
+    }
+
+    const auto serial = ++whoisSerial_;
+    whoisRequests_.insert(key, WhoisRequest { id, {}, serial });
+    QTimer::singleShot(8000, this, [this, key, serial] {
+        const auto request = whoisRequests_.find(key);
+        if (request == whoisRequests_.end() || request->serial != serial) {
+            return;
+        }
+        // Drain delayed replies before retrying the same nickname. WHOIS replies have no request ID.
+        request->expired = true;
+        const auto id = request->id;
+        const auto details = std::exchange(request->details, {});
+        emit profileReceived(id, details);
+    });
+    return true;
+}
+
+void IrcProvider::setConversationOpen(const ConversationId &id, bool open)
+{
+    const auto &target = id.remoteId;
+    if (id.accountId != account_.id || !canUseTarget(target) || isChannel(target)
+        || target.toUtf8().size() > 100) {
+        return;
+    }
+    const auto nick = canonicalTarget(target);
+    if (!open) {
+        if (presencePeers_.take(nick) != Presence::Unknown) {
+            emit presenceChanged({ account_.id, nick }, Presence::Unknown);
+        }
+        return;
+    }
+    if (state_ != ConnectionState::Connected || !socket_ || presenceUnavailable_
+        || presencePeers_.contains(nick)) {
+        return;
+    }
+    presencePeers_.insert(nick, Presence::Unknown);
+    if (!presenceTimer_.isActive()) {
+        presenceTimer_.start(0);
+    }
+}
+
 QString IrcProvider::requestChannelList()
 {
     if (state_ != ConnectionState::Connected) {
@@ -307,6 +376,14 @@ void IrcProvider::closeTransport()
         socket->disconnect(this);
         socket->abort();
         socket->deleteLater();
+    }
+    clearPresence();
+    presenceUnavailable_ = false;
+    const auto whoisRequests = std::exchange(whoisRequests_, {});
+    for (const auto &request : whoisRequests) {
+        if (!request.expired) {
+            emit profileReceived(request.id, {});
+        }
     }
     lastChannelListRequest_.invalidate();
     if (awaitingChannelListEnd_) {
@@ -364,6 +441,59 @@ void IrcProvider::checkKeepalive()
         pingSent_.start();
         if (!writeLine("PING :" + pingToken_)) {
             fail(tr("The IRC keepalive could not be sent."), true);
+        }
+    }
+}
+
+void IrcProvider::queryPresence()
+{
+    if (!presencePending_.isEmpty()) {
+        // ISON has no request ID. A late response cannot be matched to a new query.
+        presenceUnavailable_ = true;
+        clearPresence();
+        return;
+    }
+    if (presencePeers_.isEmpty() || state_ != ConnectionState::Connected || presenceUnavailable_) {
+        return;
+    }
+
+    auto peers = presencePeers_.keys();
+    std::ranges::sort(peers);
+    nextPresencePeer_ %= peers.size();
+    QByteArray line("ISON");
+    QStringList queried;
+    while (queried.size() < std::min(MaximumIsonPeers, peers.size())) {
+        const auto &nick = peers.at(nextPresencePeer_);
+        const auto encoded = nick.toUtf8();
+        if (line.size() + encoded.size() + 1 > MaximumIsonQueryBytes) {
+            break;
+        }
+        line += ' ' + encoded;
+        queried.append(nick);
+        nextPresencePeer_ = (nextPresencePeer_ + 1) % peers.size();
+    }
+    if (writeLine(line)) {
+        presencePending_ = std::move(queried);
+    } else {
+        for (const auto &nick : queried) {
+            if (auto peer = presencePeers_.find(nick); peer != presencePeers_.end()
+                && std::exchange(peer.value(), Presence::Unknown) != Presence::Unknown) {
+                emit presenceChanged({ account_.id, nick }, Presence::Unknown);
+            }
+        }
+    }
+    presenceTimer_.start(PresenceIntervalMs);
+}
+
+void IrcProvider::clearPresence()
+{
+    presenceTimer_.stop();
+    presencePending_.clear();
+    nextPresencePeer_ = 0;
+    const auto peers = std::exchange(presencePeers_, {});
+    for (auto peer = peers.cbegin(); peer != peers.cend(); ++peer) {
+        if (peer.value() != Presence::Unknown) {
+            emit presenceChanged({ account_.id, peer.key() }, Presence::Unknown);
         }
     }
 }
@@ -458,6 +588,10 @@ bool IrcProvider::sendPrivmsg(const QString &target, const QString &text, bool a
         emit notice(tr("The IRC message could not be sent."));
         return false;
     }
+    if (enabledCapabilities_.contains("echo-message")) {
+        // The server echoes its final text. A local copy would create a duplicate.
+        return true;
+    }
 
     auto conversation = makeConversation(channel ? channels_.value(key).name : target, true);
     emit conversationChanged(conversation);
@@ -547,6 +681,19 @@ void IrcProvider::dispatch(const irc::IrcMessage &message)
     if (!welcomeReceived_) {
         return;
     }
+    if (numeric == 303) {
+        handleIson(parameters);
+        return;
+    }
+    if ((numeric == 421 || numeric == 461) && parameters.size() >= 2 && parameters.at(1) == "ISON"
+        && isSelf(QString::fromUtf8(parameters.at(0))) && !presencePending_.isEmpty()) {
+        presenceUnavailable_ = true;
+        clearPresence();
+        return;
+    }
+    if (handleWhois(message, numeric) || handleJoinFailure(message, numeric)) {
+        return;
+    }
 
     const bool listFailure = ((numeric == 263 || numeric == 421 || numeric == 461) && parameters.size() >= 2
                                  && parameters.at(1) == "LIST")
@@ -569,21 +716,154 @@ void IrcProvider::dispatch(const irc::IrcMessage &message)
         case 404:
             emit notice(tr("The IRC server refused to send to this channel."));
             break;
-        case 403:
-        case 405:
-        case 471:
-        case 473:
-        case 474:
-        case 475:
-        case 476:
-        case 477:
-            emit notice(tr("The IRC server refused to join the channel (%1).").arg(numeric));
-            break;
         default:
             emit notice(tr("The IRC server returned error %1.").arg(numeric));
             break;
         }
     }
+}
+
+void IrcProvider::handleIson(const QList<QByteArray> &parameters)
+{
+    if (presencePending_.isEmpty() || parameters.size() != 2
+        || !isSelf(QString::fromUtf8(parameters.at(0)))) {
+        return;
+    }
+    QSet<QString> online;
+    for (const auto &nick : parameters.at(1).split(' ')) {
+        if (nick.isEmpty()) {
+            continue;
+        }
+        const auto key = canonicalTarget(QString::fromUtf8(nick));
+        if (!presencePending_.contains(key)) {
+            return;
+        }
+        online.insert(key);
+    }
+    const auto queried = std::exchange(presencePending_, {});
+    for (const auto &nick : queried) {
+        const auto presence = online.contains(nick) ? Presence::Online : Presence::Offline;
+        if (auto peer = presencePeers_.find(nick);
+            peer != presencePeers_.end() && std::exchange(peer.value(), presence) != presence) {
+            emit presenceChanged({ account_.id, nick }, presence);
+        }
+    }
+}
+
+bool IrcProvider::handleWhois(const irc::IrcMessage &message, int numeric)
+{
+    switch (numeric) {
+    case 301:
+    case 311:
+    case 312:
+    case 318:
+    case 330:
+    case 401:
+        break;
+    default:
+        return false;
+    }
+    const auto &parameters = message.parameters;
+    if (parameters.size() < 2 || !isSelf(QString::fromUtf8(parameters.at(0)))) {
+        return false;
+    }
+    const auto key = canonicalTarget(QString::fromUtf8(parameters.at(1)));
+    const auto request = whoisRequests_.find(key);
+    if (request == whoisRequests_.end()) {
+        return false;
+    }
+    if (numeric == 318 || numeric == 401) {
+        const auto finished = std::move(request.value());
+        whoisRequests_.erase(request);
+        if (!finished.expired) {
+            emit profileReceived(finished.id, numeric == 318 ? finished.details : ProfileDetails {});
+        }
+        return true;
+    }
+    if (request->expired) {
+        return true;
+    }
+
+    const auto addField = [&details = request->details](const QString &label, const QByteArray &value) {
+        const auto text = irc::plainText(QString::fromUtf8(value)).trimmed();
+        if (text.isEmpty()) {
+            return;
+        }
+        const auto field = std::ranges::find(details, label, &QPair<QString, QString>::first);
+        if (field == details.end()) {
+            details.append({ label, text });
+        } else {
+            field->second = text;
+        }
+    };
+    if (numeric == 311 && parameters.size() >= 6) {
+        addField(tr("Real name"), parameters.at(5));
+        addField(tr("Username"), parameters.at(2));
+    } else if (parameters.size() >= 3) {
+        if (numeric == 301) {
+            addField(tr("Away"), parameters.at(2));
+        } else if (numeric == 312) {
+            addField(tr("IRC server"), parameters.at(2));
+        } else if (numeric == 330 && parameters.at(2) != "*") {
+            addField(tr("IRC account"), parameters.at(2));
+        }
+    }
+    return true;
+}
+
+bool IrcProvider::handleJoinFailure(const irc::IrcMessage &message, int numeric)
+{
+    const auto &parameters = message.parameters;
+    QString channel;
+    QString detail;
+    if (message.command == "FAIL" && parameters.size() >= 3 && parameters.at(0) == "JOIN") {
+        detail = tr("The IRC server refused to join the channel.");
+        if (parameters.size() >= 4) {
+            channel = QString::fromUtf8(parameters.at(2));
+        }
+    } else {
+        switch (numeric) {
+        case 403:
+            detail = tr("The IRC channel does not exist.");
+            break;
+        case 405:
+            detail = tr("This IRC account has joined too many channels.");
+            break;
+        case 471:
+            detail = tr("The IRC channel is full.");
+            break;
+        case 473:
+            detail = tr("The IRC channel requires an invitation.");
+            break;
+        case 474:
+            detail = tr("This IRC account is banned from the channel.");
+            break;
+        case 475:
+            detail = tr("The IRC channel requires a valid key.");
+            break;
+        case 476:
+            detail = tr("The IRC server rejected the channel name.");
+            break;
+        case 477:
+        case 489:
+            detail = tr("The IRC server refused to join the channel (%1).").arg(numeric);
+            break;
+        default:
+            return false;
+        }
+        if (!parameters.isEmpty() && !isSelf(QString::fromUtf8(parameters.at(0)))) {
+            return true;
+        }
+        if (parameters.size() >= 2) {
+            channel = QString::fromUtf8(parameters.at(1));
+        }
+    }
+    if (validToken(channel) && isChannel(channel)) {
+        emit joinFailed({ account_.id, canonicalTarget(channel) }, detail);
+    } else {
+        emit notice(detail);
+    }
+    return true;
 }
 
 void IrcProvider::handleChannelList(const irc::IrcMessage &message)
@@ -657,7 +937,8 @@ void IrcProvider::handleCapability(const QList<QByteArray> &parameters)
             const auto name = capName(token);
             // Keep only the small set we know how to use. A faulty server can
             // otherwise send arbitrarily many LS continuation lines.
-            if (name == "message-tags" || name == "server-time" || name == "multi-prefix" || name == "sasl") {
+            if (name == "message-tags" || name == "server-time" || name == "multi-prefix"
+                || name == "echo-message" || name == "sasl") {
                 offeredCapabilities_.insert(name, token.mid(name.size() + 1));
             }
         }
@@ -737,7 +1018,7 @@ void IrcProvider::requestCapabilities(bool includeSasl)
 
     QList<QByteArray> requested;
     for (const auto &name : { QByteArrayLiteral("message-tags"), QByteArrayLiteral("server-time"),
-             QByteArrayLiteral("multi-prefix") }) {
+             QByteArrayLiteral("multi-prefix"), QByteArrayLiteral("echo-message") }) {
         if (offeredCapabilities_.contains(name) && !enabledCapabilities_.contains(name)
             && !pendingCapabilities_.contains(name)) {
             requested.append(name);
@@ -890,9 +1171,13 @@ void IrcProvider::handlePrivmsg(const irc::IrcMessage &message)
     }
     const auto remoteId = message.tags.value("msgid");
     const auto messageId = remoteId.isEmpty() ? localMessageId() : QStringLiteral("remote:") + remoteId;
+    Message received { conversation.id, messageId, sender, text, timestamp, outgoing,
+        channel && !outgoing && isMention(text) };
+    if (outgoing && enabledCapabilities_.contains("echo-message")) {
+        received.delivery = DeliveryState::Sent;
+    }
     emit conversationChanged(conversation);
-    emit messageReceived(Message { conversation.id, messageId, sender, text, timestamp, outgoing,
-        channel && !outgoing && isMention(text) });
+    emit messageReceived(received);
 }
 
 void IrcProvider::handleMembership(const irc::IrcMessage &message)

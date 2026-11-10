@@ -64,6 +64,10 @@ namespace {
         if (presetHost == u"irc.hackint.org") {
             return accountHost.compare(u"irc.eu.hackint.org", Qt::CaseInsensitive) == 0;
         }
+        if (presetHost == u"ssl.chathispano.com") {
+            return accountHost.compare(u"irc.chathispano.com", Qt::CaseInsensitive) == 0
+                || accountHost.compare(u"irc.irc-hispano.org", Qt::CaseInsensitive) == 0;
+        }
         return presetHost == u"irc.oftc.net"
             && accountHost.compare(u"irc.debian.org", Qt::CaseInsensitive) == 0;
     }

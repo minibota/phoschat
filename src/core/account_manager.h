@@ -34,6 +34,7 @@ public:
     void startAutomaticConnections();
     void shutdown();
     IChatProvider *provider(const QString &id) const;
+    bool requestProfile(const ConversationId &id);
 
 signals:
     void accountsChanged();
@@ -44,9 +45,15 @@ signals:
         const QString &accountId, phoschat::AuthenticationKind kind, const QString &detail);
     void authorizationUrlRequested(const QUrl &url);
     void conversationChanged(const phoschat::Conversation &conversation);
+    void profileReceived(const phoschat::ConversationId &id, const phoschat::ProfileDetails &details);
+    void joinFailed(const phoschat::ConversationId &id, const QString &detail);
     void messageReceived(const phoschat::Message &message);
     void messageRemoved(const phoschat::ConversationId &id, const QString &messageId);
+    void messagesReadThrough(const phoschat::ConversationId &id, qint64 sequence);
+    void historyStateChanged(const phoschat::ConversationId &id);
+    void historyCleared(const phoschat::ConversationId &id);
     void membersChanged(const phoschat::ConversationId &id, const QStringList &members);
+    void presenceChanged(const phoschat::ConversationId &id, phoschat::Presence presence);
 
 private:
     struct Session;

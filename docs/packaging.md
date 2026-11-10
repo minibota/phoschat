@@ -7,10 +7,10 @@ with Secure Transport and signed macOS packaging remain future work.
 
 | Package | Install |
 | --- | --- |
-| Debian 13 | `sudo apt install ./phoschat_0.2.1_amd64.deb` |
-| Fedora 45 | `sudo dnf install --nogpgcheck ./phoschat-0.2.1-*.x86_64.rpm` |
-| Windows x64 | Run `phoschat-0.2.1-windows-x64-setup.exe` |
-| Flatpak | `flatpak install --user ./phoschat-0.2.1-x86_64.flatpak` |
+| Debian 13 | `sudo apt install ./phoschat_0.2.2_amd64.deb` |
+| Fedora 45 | `sudo dnf install --nogpgcheck ./phoschat-0.2.2-*.x86_64.rpm` |
+| Windows x64 | Run `phoschat-0.2.2-windows-x64-setup.exe` |
+| Flatpak | `flatpak install --user ./phoschat-0.2.2-x86_64.flatpak` |
 
 The RPM and Windows installer are unsigned. Check the downloads against
 `SHA256SUMS` on the release page before installing. Flatpak uses the KDE 6.10
@@ -47,7 +47,7 @@ flatpak install --user flathub org.kde.Platform//6.10 org.kde.Sdk//6.10
 flatpak-builder --user --force-clean --disable-rofiles-fuse --repo=repo build-flatpak \
   packaging/flatpak/io.phoschat.desktop.json
 flatpak build-bundle --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo \
-  repo phoschat-0.2.1-x86_64.flatpak io.phoschat.desktop
+  repo phoschat-0.2.2-x86_64.flatpak io.phoschat.desktop
 ```
 
 ## GitHub releases
@@ -61,11 +61,24 @@ New official package builds require two repository Actions secrets, configured o
 | `TELEGRAM_API_ID` | The application's positive integer API ID from my.telegram.org |
 | `TELEGRAM_API_HASH` | The matching 32-character hexadecimal API hash |
 
-The release workflow validates their presence before building packages. It maps them to `PHOSCHAT_TELEGRAM_API_ID` and `PHOSCHAT_TELEGRAM_API_HASH` only for the relevant build steps. CMake reads the environment directly into a private generated header, without placing values in cache entries or compiler arguments. The Flatpak helper stages an ignored, private JSON file; its generated manifest contains only a file path. Private inputs are removed after the build and are not installer assets. Do not commit these values, pass them through shell command-line flags, or paste them into issues or logs.
+The release workflow validates their presence before building packages. It maps them to `PHOSCHAT_TELEGRAM_API_ID` and `PHOSCHAT_TELEGRAM_API_HASH` only for the relevant build steps. CMake reads the environment directly into a private generated header, without placing values in cache entries or compiler arguments. The Flatpak helper stages an ignored, private JSON file; its generated manifest references the file by path and omits the Telegram credentials. Private inputs are removed after the build and are not installer assets. Do not commit these values, pass them through shell command-line flags, or paste them into issues or logs.
 
 Application credentials embedded in a desktop executable can be extracted. They identify PhosChat to Telegram; they are not user authentication tokens or encryption keys. Every user still authorizes their own Telegram account, and local session keys come from the operating system's random generator. Pull-request CI never receives the real application secrets; its configured-build checks use synthetic values. Do not export Flatpak build sources or debug bundles from a directory containing the private inputs; distribute corresponding source from the clean repository tag.
 
-For a local configured build, set the two `PHOSCHAT_TELEGRAM_*` environment variables through your local secret tooling before configuring CMake. `-DPHOSCHAT_REQUIRE_TELEGRAM_APP_CREDENTIALS=ON` rejects missing values. Ordinary source builds can omit both variables and use the advanced per-account fields. Official v0.2.1 packages use these secrets for the simplified Telegram sign-in flow. Older v0.2.0 binaries retain manual setup.
+For a local configured build, set the two `PHOSCHAT_TELEGRAM_*` environment variables through your local secret tooling before configuring CMake. `-DPHOSCHAT_REQUIRE_TELEGRAM_APP_CREDENTIALS=ON` rejects missing values. Ordinary source builds can omit both variables and use the advanced per-account fields. Official packages since v0.2.1 use these secrets for the simplified Telegram sign-in flow. Older v0.2.0 binaries retain manual setup.
+
+### Optional Slack browser sign-in
+
+Slack uses public repository **Actions variables**, separate from the Telegram secrets:
+
+| Variable name | Value |
+| --- | --- |
+| `SLACK_CLIENT_ID` | The public numeric Slack application Client ID |
+| `SLACK_OAUTH_ORIGIN` | The bare HTTPS origin of the deployed authorization service, such as `https://oauth.example.test` |
+
+An existing repository secret named `SLACK_CLIENT_ID` also supplies the public ID. Supply an origin you control, with no path, trailing slash, port, credentials, query or fragment. An origin requires a valid Client ID. Leaving both unset keeps advanced Slack workspace setup available. Complete the [Slack setup](slack.md) and verify authorization before enabling public distribution.
+
+The release workflow maps these to `PHOSCHAT_SLACK_CLIENT_ID` and `PHOSCHAT_SLACK_OAUTH_ORIGIN` for native builds and includes the same public values in the generated Flatpak configuration. Local builds accept those CMake options or configure-time environment variables. No Slack client secret or user token belongs in a desktop installer. CI uses an example origin and synthetic IDs without authorizing real accounts.
 
 ### Publishing
 
@@ -83,7 +96,7 @@ with `sha256sum`. Use an authenticated GitHub CLI session to publish the
 prerelease and attach the four packages and `SHA256SUMS`. Target the exact
 commit shown on the packaging run so the tag and the built source match. If that
 commit has a different workflow from `main`, publish against an authorized
-release branch at the same commit, such as `release/v0.2.0`. [GitHub release API](https://docs.github.com/en/rest/releases/releases#create-a-release)
+release branch at the same commit, such as `release/v0.2.2`. [GitHub release API](https://docs.github.com/en/rest/releases/releases#create-a-release)
 
 The matching GitHub tag contains the corresponding source. Packages include
 the project license and applicable dependency notices. See

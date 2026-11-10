@@ -1,12 +1,16 @@
 #include "ui/styles/Theme.hpp"
 
 #include <QApplication>
+#include <QBuffer>
 #include <QColor>
+#include <QCryptographicHash>
+#include <QImageReader>
 #include <QLinearGradient>
 #include <QPainter>
 #include <QPainterPath>
 #include <QPalette>
 #include <QPixmap>
+#include <QPixmapCache>
 #include <QRadialGradient>
 #include <QSettings>
 #include <QStyleFactory>
@@ -250,6 +254,17 @@ namespace {
         QToolButton[role="accountHeader"]:focus { border-color: @focus@; }
         QToolButton[role="icon"] { padding: 3px; min-width: 23px; min-height: 23px; }
         QToolButton[role="icon"]::menu-indicator { image: none; width: 0; }
+        QToolButton[role="chatProfile"], QToolButton[role="chatProfileTitle"] {
+            border: 1px solid transparent; border-radius: 4px; background: transparent;
+            padding: 0; min-width: 0; min-height: 0;
+        }
+        QToolButton[role="chatProfileTitle"] { color: @text@; font-size: 19px; font-weight: 700; }
+        QToolButton[role="chatProfile"]:hover, QToolButton[role="chatProfileTitle"]:hover {
+            background: @row-hover@;
+        }
+        QToolButton[role="chatProfile"]:focus, QToolButton[role="chatProfileTitle"]:focus {
+            border-color: @focus@;
+        }
         QPushButton[role="primary"] {
             color: @primary-ink@; border-color: @primary-base@;
             background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 @primary-top@, stop:1 @primary-base@);
@@ -371,6 +386,48 @@ QIcon brandIcon()
 QIcon conversationIcon(bool channel)
 {
     return contextualIcon(channel ? Glyph::Channel : Glyph::Direct, QPalette::Link);
+}
+
+QPixmap photoAvatar(const QByteArray &jpeg, int side, qreal devicePixelRatio)
+{
+    if (jpeg.isEmpty() || jpeg.size() > 128 * 1024)
+        return {};
+    const int pixels = qBound(1, qRound(side * devicePixelRatio), 256);
+    const auto key
+        = QStringLiteral("phoschat.avatar/%1/%2/%3")
+              .arg(pixels)
+              .arg(devicePixelRatio)
+              .arg(QString::fromLatin1(QCryptographicHash::hash(jpeg, QCryptographicHash::Sha256).toHex()));
+    QPixmap cached;
+    if (QPixmapCache::find(key, &cached))
+        return cached;
+
+    QBuffer source;
+    source.setData(jpeg);
+    source.open(QIODevice::ReadOnly);
+    QImageReader reader(&source, "jpeg");
+    reader.setAutoDetectImageFormat(false);
+    const auto size = reader.size();
+    if (size.isEmpty() || size.width() > 512 || size.height() > 512)
+        return {};
+    const auto image = reader.read();
+    if (image.isNull())
+        return {};
+    const auto scaled
+        = image.scaled(pixels, pixels, Qt::KeepAspectRatioByExpanding, Qt::SmoothTransformation);
+
+    QPixmap result(pixels, pixels);
+    result.fill(Qt::transparent);
+    QPainter painter(&result);
+    painter.setRenderHint(QPainter::Antialiasing);
+    QPainterPath circle;
+    circle.addEllipse(QRectF(0, 0, pixels, pixels));
+    painter.setClipPath(circle);
+    painter.drawImage(QPointF((pixels - scaled.width()) / 2.0, (pixels - scaled.height()) / 2.0), scaled);
+    painter.end();
+    result.setDevicePixelRatio(devicePixelRatio);
+    QPixmapCache::insert(key, result);
+    return result;
 }
 
 QIcon searchIcon() { return contextualIcon(Glyph::Search, QPalette::PlaceholderText); }

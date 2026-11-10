@@ -90,7 +90,7 @@ elseif(UNIX AND NOT APPLE)
     set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS "${PHOSCHAT_DEB_SHLIBDEPS}")
     string(CONCAT CPACK_DEBIAN_PACKAGE_DEPENDS
         "libc6 (>= 2.41), libstdc++6 (>= 14), libqt6core6t64 (>= 6.8), libqt6gui6 (>= 6.8), "
-        "libqt6widgets6 (>= 6.8), libqt6network6 (>= 6.8), libqt6sql6 (>= 6.8), "
+        "libqt6widgets6 (>= 6.8), libqt6network6 (>= 6.8), libqt6sql6 (>= 6.8), libqt6dbus6 (>= 6.8), "
         "libqt6sql6-sqlite, qt6-qpa-plugins, ca-certificates")
     if(PHOSCHAT_USE_KEYCHAIN AND TARGET qt6keychain)
         string(APPEND CPACK_DEBIAN_PACKAGE_DEPENDS ", libqt6keychain1")

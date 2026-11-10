@@ -5,6 +5,7 @@
 #include "core/message_manager.h"
 #include "ui/Presentation.hpp"
 #include "ui/conversations/ConversationController.hpp"
+#include "ui/conversations/ConversationProfile.hpp"
 #include "ui/windows/ChatWindow.hpp"
 
 #include <QCryptographicHash>
@@ -42,11 +43,26 @@ WindowManager::WindowManager(
     , m_conversations(conversations)
     , m_messages(messages)
 {
+    connect(&m_conversations, &ConversationManager::channelJoined, this, &WindowManager::open,
+        Qt::QueuedConnection);
     connect(&m_conversations, &ConversationManager::conversationsChanged, this, [this] {
         pruneRemovedConversations();
         refreshOpenWindows();
     });
-    connect(&m_accounts, &AccountManager::accountStateChanged, this, [this] { refreshOpenWindows(); });
+    connect(&m_accounts, &AccountManager::accountStateChanged, this,
+        [this](const QString &accountId, ConnectionState state) {
+            refreshOpenWindows();
+            if (m_closing || state != ConnectionState::Connected)
+                return;
+            const auto ids = m_windows.keys();
+            for (const auto &id : ids) {
+                if (id.accountId == accountId && m_windows.value(id)) {
+                    m_messages.setConversationOpen(id, true);
+                    if (m_messages.hasPagedHistory(id))
+                        m_messages.requestHistory(id);
+                }
+            }
+        });
     connect(&m_accounts, &AccountManager::accountsChanged, this, [this] { refreshOpenWindows(); });
     connect(&m_accounts, &AccountManager::accountRemoved, this, [](const QString &id) {
         QSettings settings;
@@ -92,6 +108,11 @@ void WindowManager::showConversation(const ConversationId &id, bool focus)
         }
         window = new ChatWindow(*controller);
         m_windows.insert(id, window);
+        connect(window, &ChatWindow::profileRequested, this, [this, id, window] {
+            if (const auto value = m_conversations.conversation(id))
+                showConversationProfile(*window, m_accounts, *value);
+        });
+        m_messages.setConversationOpen(id, true);
         connect(window, &ChatWindow::activated, this, [this, id] {
             m_messages.requestHistory(id);
             m_conversations.markRead(id);
@@ -99,6 +120,7 @@ void WindowManager::showConversation(const ConversationId &id, bool focus)
         connect(window, &ChatWindow::closing, this, [this, id](const QByteArray &geometry) {
             QSettings().setValue(geometryKey(id), geometry);
             m_windows.remove(id);
+            m_messages.setConversationOpen(id, false);
         });
         refreshWindow(*window, *conversation);
         window->setMembers(m_conversations.members(id));
@@ -109,6 +131,8 @@ void WindowManager::showConversation(const ConversationId &id, bool focus)
         window->setAttribute(Qt::WA_ShowWithoutActivating, !focus);
         window->show();
         window->setAttribute(Qt::WA_ShowWithoutActivating, false);
+        if (!focus && m_messages.hasPagedHistory(id))
+            m_messages.requestHistory(id);
     }
     if (focus) {
         if (window->isMinimized()) {

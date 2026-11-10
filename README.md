@@ -29,20 +29,28 @@ Actual Qt Widgets captures with local test data. The open account contains 150 g
 
 ## What you can do
 
+The **v0.2.2 preview** adds paginated Telegram history, file sending, contact profiles and presence, and native Linux notifications.
+
 - Double-click any conversation to open or focus its own native window. PhosChat remembers window size, position and which conversations were open.
 - Switch accounts through an accordion that keeps the other account headers visible while the open list scrolls. See online, offline and connecting totals at a glance.
-- Search your conversations, pin favorites, create groups and mute individual chats.
-- Choose a popular IRC network or enter a custom server, and connect to several networks at once. Discover live channels on your connected server, or explore a curated directory of networks and channels by topic.
+- Find unread conversations first, search locally, pin favorites, create groups and mute individual chats.
+- Read earlier Telegram messages with **Load older messages**. Your reading position stays in place as more history arrives, and restored conversations load after their account reconnects.
+- See Telegram chat photos and open available profile details by clicking a conversation's name or photo. Direct chats show contact presence when the network reports it; unavailable or private presence stays unknown.
+- Send attachments in supported Telegram and Slack conversations. Delivery and read labels use the service's actual confirmations; Slack and IRC do not supply recipient read receipts.
+- Receive desktop notifications and open the matching conversation from an alert. Linux notifications also work without a visible system tray.
+- Choose a popular IRC network or enter a custom server, and connect to several networks at once. Discover live channels, explore curated suggestions by topic, and see whether joining a channel succeeded.
 - Keep IRC history on your computer. Telegram and Slack message bodies stay in memory. Save supported credentials in the system keychain, or keep them for the current run.
 
 | Protocol | Status | Available in this build |
 | --- | --- | --- |
-| **IRC / IRCv3** | Available | TLS and SASL, channels, private messages, participants, mentions, reconnect and local history. |
-| **Telegram** | Preview | Official TDLib, phone sign-in in official v0.2.1 builds, direct chats, main and archived groups, text and recent history. |
-| **Slack** | Preview | Official Web API, browser PKCE for an approved workspace app or an authorized user token, channel and DM discovery, text and rate-limited history for the last opened conversation. |
+| **IRC / IRCv3** | Available | TLS/SASL, channels and private messages, participants, network-local nick presence, WHOIS profiles, mentions, reconnect and local history. |
+| **Telegram** | Preview | Official TDLib, phone sign-in, direct chats and main/archived groups, paginated history, chat photos, profiles, contact presence, text and attachment sending, reported delivery/read states. |
+| **Slack** | Preview | Official Web API, approved workspace accounts, channels and DMs, text and file sending, profiles and active/away presence, rate-limited recent history. Optional configured browser sign-in. |
 | **Matrix** | Later | Planned after the Telegram and Slack integrations mature. |
 
-Configured Telegram builds use PhosChat's application identity, so users sign in to their own account without creating an API application. Slack requires an approved workspace application. The previews have automated adapter tests. Live sign-in and sustained messaging in an actual Telegram account or approved Slack workspace are separate verification steps. Telegram broadcast channels, secret chats, files and Slack threads are outside this preview. See the [Telegram](docs/telegram.md) and [Slack](docs/slack.md) guides for supported scope and advanced setup for custom builds.
+Configured Telegram builds use PhosChat's application identity, so users sign in to their own account without creating an API application. Slack requires an approved workspace application. Shared Slack browser sign-in additionally depends on a configured and deployed HTTPS authorization service; it is optional, and advanced workspace setup remains available. Build variables do not deploy that service or grant workspace approval.
+
+Telegram broadcast channels, secret chats and protected/auto-deleting message content remain excluded. Attachments are described in history; downloading and playing them inside PhosChat is not implemented. Slack history remains rate-limited, and Slack threads are outside this preview. Automated adapter, UI and local service tests do not replace live authorization and sustained messaging checks. See the [Telegram](docs/telegram.md) and [Slack](docs/slack.md) guides for exact scope and setup.
 
 ## Install
 
@@ -67,12 +75,12 @@ Run `python3 tests/demo_irc_server.py` for a local demo. Choose **Custom server*
 
 ## Build from source
 
-Use a C++20 compiler, CMake 3.22+, Ninja and Qt 6.8+ with Core, Gui, Widgets, Network, SQL, QSQLITE and a TLS backend. Qt Test is needed for tests. QtKeychain adds system credential storage.
+Use a C++20 compiler, CMake 3.22+, Ninja and Qt 6.8+ with Core, Gui, Widgets, Network, SQL, QSQLITE and a TLS backend. Linux also needs Qt DBus. Qt Test is needed for tests; `dbus-run-session` enables isolated Linux notification checks. QtKeychain adds system credential storage.
 
 On Debian 13:
 
 ```sh
-sudo apt install g++ cmake ninja-build qt6-base-dev libqt6sql6-sqlite qtkeychain-qt6-dev
+sudo apt install g++ cmake ninja-build qt6-base-dev libqt6sql6-sqlite qtkeychain-qt6-dev dbus-daemon
 cmake --preset debug
 cmake --build --preset debug
 ctest --preset debug
@@ -80,6 +88,8 @@ ctest --preset debug
 ```
 
 Use the `release` preset for an optimized build. On Windows, run from an MSVC developer shell with a matching Qt kit. On macOS, launch with `open build/debug/phoschat.app`. Set `CMAKE_PREFIX_PATH` if CMake cannot find the Qt kit.
+
+The optional [Slack HTTPS service](services/slack-oauth/README.md) has separate local tests: `python3 -m unittest discover -s services/slack-oauth -v`. These use fixtures and do not authorize real accounts. Release configuration is documented in [packaging](docs/packaging.md).
 
 [Architecture](docs/architecture.md) · [Protocol research](docs/protocols.md) · [Interface design](docs/ui-design.md) · [Roadmap](docs/roadmap.md)
 

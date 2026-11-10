@@ -10,8 +10,10 @@
 #include <QUrlQuery>
 
 #include <functional>
+#include <memory>
 #include <optional>
 
+class QFile;
 class QNetworkReply;
 
 namespace phoschat {
@@ -27,6 +29,9 @@ public:
         QUrl authorize;
         int historyIntervalMs { 61000 };
         int pageIntervalMs { 3200 };
+        int presenceIntervalMs { 61000 };
+        QUrl oauthOrigin {};
+        quint16 callbackPort {};
     };
     SlackProvider(const Account &account, const TestEndpoints &endpoints, QObject *parent = nullptr);
 
@@ -36,9 +41,13 @@ public:
     bool join(const QString &) override;
     bool part(const QString &) override;
     bool sendText(const ConversationId &id, const QString &text) override;
+    bool canSendFiles(const ConversationId &id) const override;
+    bool sendFile(const ConversationId &id, const QString &path) override;
+    bool requestProfile(const ConversationId &id) override;
     bool sendCommand(const ConversationId &, const QString &) override;
     QString canonicalTarget(const QString &target) const override;
     void requestHistory(const ConversationId &id) override;
+    void setConversationOpen(const ConversationId &id, bool open) override;
 
 private:
     struct Credentials {
@@ -47,6 +56,7 @@ private:
         qint64 expiresAtMs {};
         QString workspace;
         QString user;
+        QUrl oauthOrigin;
     };
     struct Result {
         QJsonObject data;
@@ -80,19 +90,30 @@ private:
     void readHistory();
     void readProfile();
     void queueProfile(const QString &id);
+    void readPresence();
+    void publishPresence(const QString &channel, Presence presence);
+    void uploadFile(const QString &channel, const QString &fileId, const QString &name, const QUrl &url,
+        const std::shared_ptr<QFile> &file);
+    void finishFile(const QString &channel, const QString &fileId, const QString &name);
+    void fileFailed(const Result &result);
+    void rememberScopes(const QString &scopes);
     void emitText(const QString &channel, const QJsonObject &object, bool historical, bool outgoing = false);
     ConversationId conversationId(const QString &channel) const;
     QString remoteChannel(const ConversationId &id) const;
     bool handleSessionError(const Result &result);
     void request(const QString &method, const QUrlQuery &query, std::optional<QByteArray> body,
         const QByteArray &contentType, bool authenticated, Finished finished);
+    void requestAt(const QUrl &url, std::optional<QByteArray> body, const QByteArray &contentType,
+        bool authenticated, Finished finished);
 
     Account account_;
     QUrl apiBase_;
     QUrl authorizationEndpoint_;
+    QUrl oauthOrigin_;
     quint16 callbackPort_ { 8765 };
     int historyIntervalMs_ { 61000 };
     int listPageIntervalMs_ { 3200 };
+    int presenceIntervalMs_ { 61000 };
     QNetworkAccessManager network_;
     SlackOAuth oauth_;
     QTimer listTimer_;
@@ -100,6 +121,7 @@ private:
     QTimer refreshTimer_;
     QTimer authTimer_;
     QTimer profileTimer_;
+    QTimer presenceTimer_;
     QSet<QNetworkReply *> replies_;
     Credentials credentials_;
     QString selected_;
@@ -108,7 +130,15 @@ private:
     QHash<QString, Conversation> channels_;
     QHash<QString, QString> directPeers_;
     QHash<QString, QString> profiles_;
+    QHash<QString, ProfileDetails> profileDetails_;
+    QHash<QString, ProfileDetails> conversationDetails_;
+    QSet<QString> requestedProfiles_;
+    std::optional<QSet<QString>> grantedScopes_;
+    QString activeProfile_;
     QStringList pendingProfiles_;
+    QSet<QString> openConversations_;
+    QHash<QString, Presence> presenceByChannel_;
+    QHash<QString, qint64> nextPresenceCheck_;
     QHash<QString, History> histories_;
     QSet<QString> sending_;
     ConnectionState state_ { ConnectionState::Disconnected };
@@ -118,6 +148,9 @@ private:
     bool refreshDeferred_ {};
     bool credentialsDirty_ {};
     bool profileInFlight_ {};
+    bool uploadInFlight_ {};
+    bool presenceInFlight_ {};
+    bool presenceUnavailable_ {};
 };
 
 } // namespace phoschat

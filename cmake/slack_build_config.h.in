@@ -1,0 +1,5 @@
+#pragma once
+
+// Public application identifier. OAuth uses PKCE and never an embedded client secret.
+#define PHOSCHAT_SLACK_CLIENT_ID "@PHOSCHAT_SLACK_CLIENT_ID@"
+#define PHOSCHAT_SLACK_OAUTH_ORIGIN "@PHOSCHAT_SLACK_OAUTH_ORIGIN@"

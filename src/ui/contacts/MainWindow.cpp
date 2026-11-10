@@ -41,6 +41,8 @@ namespace {
     constexpr int kAccountRole = Qt::UserRole + 1;
     constexpr int kTargetRole = Qt::UserRole + 2;
     constexpr int kSectionRole = Qt::UserRole + 3;
+    constexpr int kUnreadRole = Qt::UserRole + 4;
+    constexpr int kActivityRole = Qt::UserRole + 5;
 
     constexpr auto kMainGeometry = "windows/mainGeometry";
     constexpr auto kGrouping = "ui/grouping";
@@ -147,6 +149,11 @@ MainWindow::MainWindow(
         return action;
     };
     addPreference(tr("Restore chats on startup"), kRestoreChats, true);
+    auto *notifications = addPreference(tr("Message notifications"), "notifications/enabled", true);
+    connect(settingsMenu, &QMenu::aboutToShow, notifications, [notifications] {
+        const QSignalBlocker blocker(notifications);
+        notifications->setChecked(QSettings().value(QStringLiteral("notifications/enabled"), true).toBool());
+    });
     m_closeToTray = addPreference(tr("Close to tray"), kCloseToTray, true);
     m_minimizeToTray = addPreference(tr("Minimize to tray"), kMinimizeToTray, false);
     m_closeToTray->setEnabled(false);
@@ -192,12 +199,15 @@ MainWindow::MainWindow(
     m_search->setPlaceholderText(tr("Find a conversation…"));
     m_search->setAccessibleName(tr("Find a conversation"));
     m_search->setClearButtonEnabled(true);
-    auto *searchAction = m_search->addAction(searchIcon(), QLineEdit::LeadingPosition);
-    layout->addWidget(m_search);
+    m_search->hide();
 
     auto *section = new QHBoxLayout;
     section->addWidget(label(tr("CONVERSATIONS"), "section"));
     section->addStretch();
+    auto *searchButton = iconButton(searchIcon(), tr("Find a conversation"));
+    searchButton->setObjectName(QStringLiteral("conversationSearchButton"));
+    searchButton->setCheckable(true);
+    section->addWidget(searchButton);
     auto *add = iconButton(addIcon(), tr("Start a conversation"));
     auto *appearance = new QActionGroup(appearanceMenu);
     for (const auto &[theme, name] :
@@ -206,10 +216,10 @@ MainWindow::MainWindow(
         action->setCheckable(true);
         action->setChecked(preferredTheme() == theme);
         appearance->addAction(action);
-        connect(action, &QAction::triggered, this, [this, more, searchAction, add, theme] {
+        connect(action, &QAction::triggered, this, [this, more, searchButton, add, theme] {
             setPreferredTheme(*qApp, theme);
             more->setIcon(moreIcon());
-            searchAction->setIcon(searchIcon());
+            searchButton->setIcon(searchIcon());
             add->setIcon(addIcon());
             reloadConversations();
         });
@@ -221,6 +231,7 @@ MainWindow::MainWindow(
     add->setMenu(createMenu);
     section->addWidget(add);
     layout->addLayout(section);
+    layout->addWidget(m_search);
 
     m_tree = new QTreeWidget;
     m_tree->setProperty("role", QStringLiteral("conversations"));
@@ -337,6 +348,12 @@ MainWindow::MainWindow(
     });
     connect(&m_accounts, &AccountManager::errorOccurred, this,
         [this](const QString &, const QString &message) { showStatusMessage(message); });
+    connect(&m_conversations, &ConversationManager::channelJoinStarted, this,
+        [this](const QString &channel) { showStatusMessage(tr("Joining %1…").arg(channel)); });
+    connect(&m_conversations, &ConversationManager::channelJoined, this, [this](const ConversationId &id) {
+        if (const auto channel = m_conversations.conversation(id))
+            showStatusMessage(tr("Joined %1").arg(channel->title));
+    });
     m_reloadTimer = new QTimer(this);
     m_reloadTimer->setSingleShot(true);
     m_reloadTimer->setInterval(30);
@@ -362,9 +379,24 @@ MainWindow::MainWindow(
     });
 
     auto *find = new QShortcut(QKeySequence::Find, this);
-    connect(find, &QShortcut::activated, this, [this] {
+    connect(find, &QShortcut::activated, this, [this, searchButton] {
+        searchButton->setChecked(true);
         m_search->setFocus();
         m_search->selectAll();
+    });
+    auto *closeSearch = new QShortcut(QKeySequence(Qt::Key_Escape), this);
+    closeSearch->setEnabled(false);
+    connect(closeSearch, &QShortcut::activated, searchButton,
+        [searchButton] { searchButton->setChecked(false); });
+    connect(searchButton, &QToolButton::toggled, this, [this, searchButton, closeSearch](bool visible) {
+        m_search->setVisible(visible);
+        closeSearch->setEnabled(visible);
+        if (visible) {
+            m_search->setFocus();
+        } else {
+            m_search->clear();
+            searchButton->setFocus();
+        }
     });
     auto *join = new QShortcut(QKeySequence(QStringLiteral("Ctrl+J")), this);
     connect(join, &QShortcut::activated, this, [this] { showStartConversation(true); });
@@ -520,12 +552,7 @@ void MainWindow::showStartConversation(bool channel)
     const auto id = network->currentData().toString();
     const auto name = target->text().trimmed();
     if (channel) {
-        if (m_conversations.joinChannel(id, name)) {
-            showStatusMessage(tr("Joining %1…").arg(name));
-        } else {
-            showStatusMessage(
-                tr("The channel could not be joined. Check its name and the account connection."));
-        }
+        m_conversations.joinChannel(id, name);
     } else {
         const auto conversation = m_conversations.openDirect(id, name);
         if (!conversation.isValid()) {
@@ -567,6 +594,7 @@ void MainWindow::reloadConversations()
     const auto colors = QApplication::palette();
     m_tree->setRootIndex({});
     m_tree->clear();
+    QTreeWidgetItem *selectedItem = nullptr;
     QHash<QString, QTreeWidgetItem *> sections;
     auto ensureSection = [&](const QString &key, const QString &title) {
         auto *section = sections.value(key, nullptr);
@@ -649,7 +677,10 @@ void MainWindow::reloadConversations()
                 : conversation.title);
         item->setData(0, kAccountRole, id.accountId);
         item->setData(0, kTargetRole, id.remoteId);
-        item->setIcon(0, conversationIcon(channel));
+        item->setData(0, kUnreadRole, conversation.unread);
+        item->setData(0, kActivityRole, conversation.updated);
+        const auto photo = photoAvatar(conversation.avatar, m_tree->iconSize().width(), devicePixelRatioF());
+        item->setIcon(0, photo.isNull() ? conversationIcon(channel) : QIcon(photo));
         item->setText(1, account.protocol == Protocol::Telegram ? QStringLiteral("TG") : protocol);
         item->setToolTip(1, protocol);
         item->setTextAlignment(1, Qt::AlignCenter);
@@ -666,6 +697,7 @@ void MainWindow::reloadConversations()
                 2, conversation.unread > 99 ? QStringLiteral("99+") : QString::number(conversation.unread));
             item->setTextAlignment(2, Qt::AlignCenter);
             item->setForeground(2, colors.brush(QPalette::Link));
+            item->setToolTip(2, tr("%1 unread messages").arg(conversation.unread));
         }
         auto tooltip = tr("%1 · %2").arg(conversation.title, accountName);
         if (conversation.muted) {
@@ -676,13 +708,27 @@ void MainWindow::reloadConversations()
         }
         item->setToolTip(0, tooltip.toHtmlEscaped());
         if (selection && *selection == id) {
-            m_tree->setCurrentItem(item);
+            selectedItem = item;
         }
     }
 
     for (auto it = sections.cbegin(); it != sections.cend(); ++it) {
+        // Keep section order and the existing order of read conversations. An
+        // unread chat moves within its section, never ahead of another account.
+        auto children = it.value()->takeChildren();
+        std::stable_sort(children.begin(), children.end(), [](const auto *a, const auto *b) {
+            const bool firstUnread = a->data(0, kUnreadRole).toInt() > 0;
+            const bool secondUnread = b->data(0, kUnreadRole).toInt() > 0;
+            if (firstUnread != secondUnread)
+                return firstUnread;
+            return firstUnread
+                && a->data(0, kActivityRole).toDateTime() > b->data(0, kActivityRole).toDateTime();
+        });
+        it.value()->addChildren(children);
         it.value()->setExpanded(!filter.isEmpty() || m_expanded.value(it.key(), true));
     }
+    if (selectedItem)
+        m_tree->setCurrentItem(selectedItem);
     const bool empty = sections.isEmpty();
     rebuildAccountSections(filterChanged);
     m_conversationPanel->show();

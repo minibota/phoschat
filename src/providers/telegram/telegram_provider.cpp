@@ -9,6 +9,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonArray>
+#include <QMimeDatabase>
 #include <QRegularExpression>
 #include <QStandardPaths>
 #include <QSysInfo>
@@ -16,7 +17,9 @@
 #include <QTimeZone>
 #include <QTimer>
 
+#include <algorithm>
 #include <cmath>
+#include <limits>
 #include <utility>
 
 namespace phoschat {
@@ -27,6 +30,8 @@ namespace {
     constexpr qint64 MaxTelegramInteger = 9007199254740991;
     constexpr int ChatPageSize = 100;
     constexpr int HistoryLimit = 50;
+    constexpr int MaxAvatarBytes = 128 * 1024;
+    constexpr int MaxAvatarDownloads = 4;
 
     QString typeOf(const QJsonObject &object) { return object.value(u"@type"_s).toString(); }
 
@@ -66,10 +71,96 @@ namespace {
         return true;
     }
 
+    QString safeFilename(QString name)
+    {
+        name.replace(u'\\', u'/');
+        name = name.section(u'/', -1);
+        name.removeIf([](QChar character) {
+            return character.category() == QChar::Other_Control
+                || character.category() == QChar::Other_Format;
+        });
+        return name.left(255).trimmed();
+    }
+
+    QString displayContent(const QJsonObject &content)
+    {
+        const auto type = typeOf(content);
+        if (type == u"messageText")
+            return content.value(u"text"_s).toObject().value(u"text"_s).toString();
+        QString label;
+        QString field;
+        if (type == u"messagePhoto") {
+            label = TelegramProvider::tr("Photo");
+        } else if (type == u"messageVideo") {
+            label = TelegramProvider::tr("Video");
+            field = u"video"_s;
+        } else if (type == u"messageAudio") {
+            label = TelegramProvider::tr("Audio");
+            field = u"audio"_s;
+        } else if (type == u"messageDocument") {
+            label = TelegramProvider::tr("File");
+            field = u"document"_s;
+        } else if (type == u"messageVoiceNote") {
+            label = TelegramProvider::tr("Voice message");
+        } else if (type == u"messageVideoNote") {
+            label = TelegramProvider::tr("Video message");
+        } else if (type == u"messageAnimation") {
+            label = TelegramProvider::tr("Animation");
+            field = u"animation"_s;
+        } else if (type == u"messageSticker") {
+            label = TelegramProvider::tr("Sticker");
+        } else {
+            return {};
+        }
+        const auto filename = safeFilename(content.value(field).toObject().value(u"file_name"_s).toString());
+        if (!filename.isEmpty())
+            label += u" · "_s + filename;
+        const auto caption = content.value(u"caption"_s).toObject().value(u"text"_s).toString();
+        if (!caption.isEmpty())
+            label += u'\n' + caption;
+        return label;
+    }
+
     QString errorCode(const QJsonObject &response)
     {
         const auto code = response.value(u"code"_s).toInt();
         return code == 0 ? QStringLiteral("unknown") : QString::number(code);
+    }
+
+    int smallAvatarId(const QJsonObject &photo)
+    {
+        const auto file = photo.value(u"small"_s).toObject();
+        const auto local = file.value(u"local"_s).toObject();
+        const int id = file.value(u"id"_s).toInt();
+        const bool available = local.value(u"can_be_downloaded"_s).toBool()
+            || local.value(u"is_downloading_completed"_s).toBool();
+        return id > 0 && available && file.value(u"size"_s).toInteger() <= MaxAvatarBytes
+                && file.value(u"expected_size"_s).toInteger() <= MaxAvatarBytes
+            ? id
+            : 0;
+    }
+
+    QByteArray readAvatar(const QJsonObject &file, const QString &profile)
+    {
+        const auto local = file.value(u"local"_s).toObject();
+        if (!local.value(u"is_downloading_completed"_s).toBool())
+            return {};
+        const auto root = QFileInfo(profile).canonicalFilePath();
+        const QFileInfo photo(local.value(u"path"_s).toString());
+        const auto path = photo.canonicalFilePath();
+        if (root.isEmpty() || path.isEmpty() || !photo.isAbsolute() || !photo.isFile() || photo.size() <= 0
+            || photo.size() > MaxAvatarBytes)
+            return {};
+        const auto relative = QDir(root).relativeFilePath(path);
+        if (QDir::isAbsolutePath(relative) || relative == u".." || relative.startsWith(u"../"))
+            return {};
+        QFile input(path);
+        if (!input.open(QIODevice::ReadOnly))
+            return {};
+        const auto jpeg = input.read(MaxAvatarBytes + 1);
+        if (jpeg.size() > MaxAvatarBytes || !jpeg.startsWith(QByteArrayView("\xff\xd8\xff", 3)))
+            return {};
+        return jpeg;
     }
 
 } // namespace
@@ -108,7 +199,8 @@ void TelegramProvider::removeLocalData(const QString &accountId)
 
 Capabilities TelegramProvider::capabilities() const
 {
-    return Capability::Text | Capability::DirectMessages | Capability::Groups | Capability::RemoteHistory;
+    return Capability::Text | Capability::DirectMessages | Capability::Groups | Capability::RemoteHistory
+        | Capability::PaginatedHistory | Capability::ReadReceipts | Capability::Files | Capability::Presence;
 }
 
 void TelegramProvider::connectAccount(const QByteArray &secret)
@@ -206,6 +298,68 @@ bool TelegramProvider::sendText(const ConversationId &id, const QString &text)
     return true;
 }
 
+bool TelegramProvider::canSendFiles(const ConversationId &id) const
+{
+    const auto chat = chats_.constFind(chatId(id));
+    if (state_ != ConnectionState::Connected || chat == chats_.cend() || chat->protectedContent
+        || chat->autoDeletes)
+        return false;
+    for (const auto &permission :
+        { u"can_send_documents"_s, u"can_send_photos"_s, u"can_send_videos"_s, u"can_send_audios"_s }) {
+        if (chat->permissions.value(permission).toBool(true))
+            return true;
+    }
+    return false;
+}
+
+bool TelegramProvider::sendFile(const ConversationId &id, const QString &path)
+{
+    const auto remoteId = chatId(id);
+    const auto chat = chats_.constFind(remoteId);
+    if (!canSendFiles(id)) {
+        emit notice(tr("This Telegram conversation is unavailable for sending attachments."));
+        return false;
+    }
+    const QFileInfo file(path);
+    const auto canonicalPath = file.canonicalFilePath();
+    if (!file.isAbsolute() || !file.isFile() || !file.isReadable() || file.size() <= 0
+        || canonicalPath.isEmpty()) {
+        emit notice(tr("The attachment could not be opened."));
+        return false;
+    }
+
+    const auto mime = QMimeDatabase().mimeTypeForFile(canonicalPath, QMimeDatabase::MatchContent).name();
+    auto type = u"inputMessageDocument"_s;
+    auto field = u"document"_s;
+    auto permission = u"can_send_documents"_s;
+    if ((mime == u"image/jpeg" || mime == u"image/png") && file.size() <= 10 * 1024 * 1024) {
+        type = u"inputMessagePhoto"_s;
+        field = u"photo"_s;
+        permission = u"can_send_photos"_s;
+    } else if (mime == u"video/mp4") {
+        type = u"inputMessageVideo"_s;
+        field = u"video"_s;
+        permission = u"can_send_videos"_s;
+    } else if (mime == u"audio/mpeg" || mime == u"audio/mp4" || mime == u"audio/x-m4a") {
+        type = u"inputMessageAudio"_s;
+        field = u"audio"_s;
+        permission = u"can_send_audios"_s;
+    }
+    if (!chat->permissions.value(permission).toBool(true)) {
+        emit notice(tr("This Telegram chat does not allow that type of attachment."));
+        return false;
+    }
+
+    const QJsonObject input { { u"@type"_s, u"inputFileLocal"_s }, { u"path"_s, canonicalPath } };
+    QJsonObject content { { u"@type"_s, type }, { field, input } };
+    if (field == u"document")
+        content.insert(u"disable_content_type_detection"_s, true);
+    request({ { u"@type"_s, u"sendMessage"_s }, { u"chat_id"_s, remoteId },
+                { u"input_message_content"_s, content } },
+        u"send"_s, remoteId);
+    return true;
+}
+
 bool TelegramProvider::sendCommand(const ConversationId &, const QString &)
 {
     emit notice(tr("IRC commands are unavailable in Telegram conversations."));
@@ -217,6 +371,27 @@ QString TelegramProvider::canonicalTarget(const QString &target) const
     const ConversationId id { account_.id, target.trimmed() };
     const auto remoteId = chatId(id);
     return remoteId ? QString::number(owner_) + u'/' + QString::number(remoteId) : QString {};
+}
+
+bool TelegramProvider::requestProfile(const ConversationId &id)
+{
+    const auto remoteId = chatId(id);
+    const auto chat = chats_.constFind(remoteId);
+    if (state_ != ConnectionState::Connected || chat == chats_.cend() || chat->peer <= 0)
+        return false;
+    if (pendingProfiles_.contains(remoteId))
+        return true;
+    pendingProfiles_.insert(remoteId, {});
+    if (chat->kind == ConversationKind::Direct) {
+        request({ { u"@type"_s, u"getUser"_s }, { u"user_id"_s, chat->peer } }, u"profile-user"_s, remoteId);
+    } else if (chat->supergroup) {
+        request({ { u"@type"_s, u"getSupergroupFullInfo"_s }, { u"supergroup_id"_s, chat->peer } },
+            u"profile-details"_s, remoteId);
+    } else {
+        request({ { u"@type"_s, u"getBasicGroupFullInfo"_s }, { u"basic_group_id"_s, chat->peer } },
+            u"profile-details"_s, remoteId);
+    }
+    return true;
 }
 
 void TelegramProvider::submitAuthentication(AuthenticationKind kind, const QString &value)
@@ -286,16 +461,93 @@ void TelegramProvider::markRead(const ConversationId &id)
 void TelegramProvider::requestHistory(const ConversationId &id)
 {
     const auto remoteId = chatId(id);
-    if (!remoteId || state_ != ConnectionState::Connected || historyLoaded_.contains(remoteId)
-        || historyPending_.contains(remoteId))
+    if (!remoteId || histories_.value(remoteId).initialFinished)
         return;
-    historyPending_.insert(remoteId);
-    if (chats_.contains(remoteId))
-        fetchHistory(remoteId);
-    else if (!chatPending_.contains(remoteId)) {
-        chatPending_.insert(remoteId);
-        request({ { u"@type"_s, u"getChat"_s }, { u"chat_id"_s, remoteId } }, u"chat"_s, remoteId);
+    beginHistory(remoteId);
+}
+
+void TelegramProvider::requestOlderHistory(const ConversationId &id)
+{
+    if (const auto remoteId = chatId(id))
+        beginHistory(remoteId);
+}
+
+HistoryState TelegramProvider::historyState(const ConversationId &id) const
+{
+    const auto remoteId = chatId(id);
+    const auto chat = chats_.constFind(remoteId);
+    if (!remoteId || state_ != ConnectionState::Connected
+        || (chat != chats_.cend() && (chat->protectedContent || chat->autoDeletes)))
+        return HistoryState::Unavailable;
+    const auto history = histories_.value(remoteId);
+    if (history.complete)
+        return HistoryState::Complete;
+    return history.active ? HistoryState::Loading : HistoryState::Ready;
+}
+
+void TelegramProvider::setConversationOpen(const ConversationId &id, bool open)
+{
+    if (id.accountId != account_.id || id.remoteId.isEmpty())
+        return;
+    if (open)
+        openConversations_.insert(id.remoteId);
+    else
+        openConversations_.remove(id.remoteId);
+    if (const auto remoteId = chatId(id))
+        syncOpenChat(remoteId);
+}
+
+void TelegramProvider::beginHistory(qint64 id)
+{
+    const auto chat = chats_.constFind(id);
+    if (chat != chats_.cend() && (chat->protectedContent || chat->autoDeletes)) {
+        emit notice(tr("This Telegram chat uses protected or auto-deleting messages. Open it in an "
+                       "official Telegram client; PhosChat does not yet support these messages."));
+        return;
     }
+    auto &history = histories_[id];
+    if (history.active || history.complete)
+        return;
+    history.active = true;
+    history.remaining = HistoryLimit;
+    notifyHistory(id);
+    fetchHistory(id);
+}
+
+void TelegramProvider::notifyHistory(qint64 id)
+{
+    if (owner_)
+        emit historyStateChanged({ account_.id, QString::number(owner_) + u'/' + QString::number(id) });
+}
+
+void TelegramProvider::syncOpenChat(qint64 id)
+{
+    const auto chat = chats_.constFind(id);
+    const bool wanted = owner_
+        && openConversations_.contains(QString::number(owner_) + u'/' + QString::number(id))
+        && chat != chats_.cend() && !chat->protectedContent && !chat->autoDeletes;
+    if (!wanted && openedChats_.remove(id)) {
+        clearPeerPresence(id);
+        request({ { u"@type"_s, u"closeChat"_s }, { u"chat_id"_s, id } }, u"close-chat"_s, id);
+    } else if (wanted && state_ == ConnectionState::Connected && !openedChats_.contains(id)) {
+        openedChats_.insert(id);
+        requestPeerPresence(id);
+        request({ { u"@type"_s, u"openChat"_s }, { u"chat_id"_s, id } }, u"open-chat"_s, id);
+    }
+}
+
+void TelegramProvider::refreshChatHistoryAccess(qint64 id)
+{
+    syncOpenChat(id);
+    const auto chat = chats_.constFind(id);
+    if (chat != chats_.cend() && (chat->protectedContent || chat->autoDeletes)) {
+        // Invalidate in-flight history and remove already displayed messages.
+        histories_.remove(id);
+        readPending_.remove(id);
+        if (owner_)
+            emit historyCleared({ account_.id, QString::number(owner_) + u'/' + QString::number(id) });
+    }
+    notifyHistory(id);
 }
 
 void TelegramProvider::setState(ConnectionState state)
@@ -327,9 +579,16 @@ void TelegramProvider::reset()
     networkReady_ = false;
     chatLists_ = {};
     chats_.clear();
+    avatars_.clear();
+    avatarQueue_.clear();
+    pendingAvatars_ = 0;
+    pendingProfiles_.clear();
     users_.clear();
-    historyPending_.clear();
-    historyLoaded_.clear();
+    pendingPeerPresence_.clear();
+    onlinePeerExpiries_.clear();
+    histories_.clear();
+    openedChats_.clear();
+    settledTemporaryMessages_.clear();
     chatPending_.clear();
     readPending_.clear();
 }
@@ -343,11 +602,13 @@ void TelegramProvider::fail(const QString &message, bool retryable)
     emit errorOccurred(message, retryable);
 }
 
-void TelegramProvider::request(QJsonObject object, const QString &operation, qint64 chatId)
+void TelegramProvider::request(QJsonObject object, const QString &operation, qint64 chatId, quint64 token)
 {
     if (client_ <= 0)
         return;
-    object.insert(u"@extra"_s, QJsonObject { { u"operation"_s, operation }, { u"chat"_s, chatId } });
+    object.insert(u"@extra"_s,
+        QJsonObject { { u"operation"_s, operation }, { u"chat"_s, chatId },
+            { u"token"_s, static_cast<qint64>(token) } });
     transport_.send(client_, object);
 }
 
@@ -363,13 +624,17 @@ void TelegramProvider::processEvent(const QJsonObject &event)
         updateConnectionState();
     } else if (type == u"updateUser") {
         updateUser(event.value(u"user"_s).toObject());
+    } else if (type == u"updateUserStatus") {
+        updatePeerPresence(telegramId(event.value(u"user_id"_s)), event.value(u"status"_s).toObject());
     } else if (type == u"updateNewChat") {
         acceptChat(event.value(u"chat"_s).toObject());
-    } else if (type == u"updateNewMessage" || type == u"updateMessageSendSucceeded") {
+    } else if (type == u"updateNewMessage") {
         acceptMessage(event.value(u"message"_s).toObject(), false);
-    } else if (type == u"updateMessageSendFailed") {
-        emit notice(tr("Telegram could not send the message (error %1).")
-                .arg(errorCode(event.value(u"error"_s).toObject())));
+    } else if (type == u"updateMessageSendSucceeded" || type == u"updateMessageSendFailed") {
+        acceptSendResult(event, type == u"updateMessageSendFailed");
+    } else if (type == u"updateChatReadOutbox") {
+        updateReadOutbox(
+            telegramId(event.value(u"chat_id"_s)), telegramId(event.value(u"last_read_outbox_message_id"_s)));
     } else if (type == u"updateDeleteMessages" && owner_ && !event.value(u"from_cache"_s).toBool()) {
         const auto chat = telegramId(event.value(u"chat_id"_s));
         if (!chats_.contains(chat))
@@ -385,11 +650,20 @@ void TelegramProvider::processEvent(const QJsonObject &event)
         const auto chat = chats_.find(id);
         if (chat == chats_.end())
             return;
+        if (type == u"updateChatPhoto") {
+            const auto fileId = smallAvatarId(event.value(u"photo"_s).toObject());
+            if (chat->avatarFile != fileId) {
+                setAvatar(id, *chat, fileId);
+                announce(id, *chat);
+                loadAvatars();
+            }
+            return;
+        }
         if (type == u"updateChatTitle") {
             chat->title = event.value(u"title"_s).toString();
         } else if (type == u"updateChatPermissions") {
-            chat->canSend
-                = event.value(u"permissions"_s).toObject().value(u"can_send_basic_messages"_s).toBool();
+            chat->permissions = event.value(u"permissions"_s).toObject();
+            chat->canSend = chat->permissions.value(u"can_send_basic_messages"_s).toBool();
         } else if (type == u"updateChatHasProtectedContent") {
             chat->protectedContent = event.value(u"has_protected_content"_s).toBool();
         } else if (type == u"updateChatMessageAutoDeleteTime") {
@@ -398,6 +672,7 @@ void TelegramProvider::processEvent(const QJsonObject &event)
             return;
         }
         announce(id, *chat);
+        refreshChatHistoryAccess(id);
     }
 }
 
@@ -466,21 +741,104 @@ void TelegramProvider::processResult(const QJsonObject &event)
         chatPending_.remove(id);
         if (!error)
             acceptChat(event);
-        if (chats_.contains(id))
+        if (!error && chats_.contains(id)) {
             fetchHistory(id);
-        else
-            historyPending_.remove(id);
+        } else {
+            histories_[id].active = false;
+            notifyHistory(id);
+            emit notice(tr("Telegram could not open this conversation's history."));
+        }
     } else if (operation == u"history") {
-        historyPending_.remove(id);
+        auto history = histories_.find(id);
+        if (history == histories_.end() || !history->pending
+            || tag.value(u"token"_s).toInteger() != static_cast<qint64>(history->requestToken))
+            return;
+        history->pending = false;
         if (error) {
-            emit notice(tr("Telegram could not load recent messages (error %1).").arg(errorCode(event)));
+            history->active = false;
+            notifyHistory(id);
+            emit notice(tr("Telegram could not load messages (error %1). Try loading earlier messages again.")
+                    .arg(errorCode(event)));
             return;
         }
-        historyLoaded_.insert(id);
         const auto messages = event.value(u"messages"_s).toArray();
-        for (auto index = messages.size(); index > 0; --index)
-            acceptMessage(messages.at(index - 1).toObject(), true);
+        if (messages.isEmpty()) {
+            history->complete = true;
+            history->active = false;
+            history->initialFinished = true;
+            notifyHistory(id);
+            return;
+        }
+        // Advance using raw messages, including media the preview cannot display.
+        // Repeated page boundaries are excluded before emitting historical text.
+        qint64 oldest = history->cursor;
+        QHash<qint64, QJsonObject> page;
+        for (const auto &value : messages) {
+            const auto message = value.toObject();
+            const auto messageId = telegramId(message.value(u"id"_s));
+            if (telegramId(message.value(u"chat_id"_s)) != id || messageId <= 0
+                || (history->cursor && messageId >= history->cursor))
+                continue;
+            page.insert(messageId, message);
+            if (!oldest || messageId < oldest)
+                oldest = messageId;
+        }
+        if (page.isEmpty()) {
+            history->active = false;
+            notifyHistory(id);
+            emit notice(tr(
+                "Telegram returned no earlier messages in this page. Try loading earlier messages again."));
+            return;
+        }
+        history->cursor = oldest;
+        history->remaining -= static_cast<int>(page.size());
+        const bool more = history->remaining > 0;
+        if (!more) {
+            history->active = false;
+            history->initialFinished = true;
+        }
+        const auto token = history->requestToken;
+        auto ids = page.keys();
+        std::sort(ids.begin(), ids.end());
+        for (const auto messageId : ids)
+            acceptMessage(page.value(messageId), true);
         sendRead(id);
+        notifyHistory(id);
+        if (more) {
+            QTimer::singleShot(0, this, [this, id, token] {
+                const auto current = histories_.constFind(id);
+                if (current != histories_.cend() && current->active && current->requestToken == token)
+                    fetchHistory(id);
+            });
+        }
+    } else if (operation == u"open-chat" && error) {
+        openedChats_.remove(id);
+        clearPeerPresence(id);
+        emit notice(tr("Telegram could not open chat updates (error %1).").arg(errorCode(event)));
+    } else if (operation == u"avatar") {
+        finishAvatar(static_cast<int>(id), type == u"file" ? event : QJsonObject {});
+    } else if (operation == u"presence-user") {
+        const auto chat = chats_.constFind(id);
+        if (pendingPeerPresence_.remove(id) && type == u"user" && chat != chats_.cend()
+            && telegramId(event.value(u"id"_s)) == chat->peer)
+            updateUser(event);
+    } else if (operation == u"profile-user") {
+        const auto chat = chats_.constFind(id);
+        auto details = pendingProfiles_.find(id);
+        if (chat == chats_.cend() || details == pendingProfiles_.end())
+            return;
+        if (type == u"user" && telegramId(event.value(u"id"_s)) == chat->peer) {
+            updateUser(event);
+            const auto usernames
+                = event.value(u"usernames"_s).toObject().value(u"active_usernames"_s).toArray();
+            const auto username = usernames.isEmpty() ? QString {} : usernames.first().toString().left(64);
+            if (!username.isEmpty())
+                details->append({ tr("Username"), u'@' + username });
+        }
+        request(
+            { { u"@type"_s, u"getUserFullInfo"_s }, { u"user_id"_s, chat->peer } }, u"profile-details"_s, id);
+    } else if (operation == u"profile-details") {
+        finishProfile(id, event);
     } else if (operation == u"send") {
         if (error)
             emit notice(tr("Telegram could not send the message (error %1).").arg(errorCode(event)));
@@ -588,6 +946,8 @@ void TelegramProvider::updateConnectionState()
     if (!authorized_ || !owner_)
         return;
     const bool becameConnected = networkReady_ && state_ != ConnectionState::Connected;
+    if (!networkReady_)
+        onlinePeerExpiries_.clear();
     setState(networkReady_ ? ConnectionState::Connected : ConnectionState::Reconnecting);
     if (becameConnected) {
         // The core clears send availability while offline. Restore it for every
@@ -596,6 +956,16 @@ void TelegramProvider::updateConnectionState()
             announce(chat.key(), *chat);
         loadMoreChats(false);
         loadMoreChats(true);
+        loadAvatars();
+        for (const auto id : chats_.keys()) {
+            if (openedChats_.contains(id))
+                requestPeerPresence(id);
+            syncOpenChat(id);
+        }
+        for (const auto id : histories_.keys()) {
+            notifyHistory(id);
+            fetchHistory(id);
+        }
     }
 }
 
@@ -606,6 +976,65 @@ void TelegramProvider::updateUser(const QJsonObject &user)
         = (user.value(u"first_name"_s).toString() + u' ' + user.value(u"last_name"_s).toString()).trimmed();
     if (id > 0 && !name.isEmpty())
         users_.insert(id, name);
+    if (user.contains(u"status"_s))
+        updatePeerPresence(id, user.value(u"status"_s).toObject());
+}
+
+void TelegramProvider::requestPeerPresence(qint64 id)
+{
+    const auto chat = chats_.constFind(id);
+    if (state_ != ConnectionState::Connected || chat == chats_.cend()
+        || chat->kind != ConversationKind::Direct || chat->peer <= 0 || chat->peer == owner_
+        || pendingPeerPresence_.contains(id))
+        return;
+    pendingPeerPresence_.insert(id);
+    request({ { u"@type"_s, u"getUser"_s }, { u"user_id"_s, chat->peer } }, u"presence-user"_s, id);
+}
+
+void TelegramProvider::updatePeerPresence(qint64 userId, const QJsonObject &status)
+{
+    if (state_ != ConnectionState::Connected || userId <= 0 || userId == owner_)
+        return;
+
+    auto presence = Presence::Unknown;
+    const auto type = typeOf(status);
+    const auto expiry = qint64(status.value(u"expires"_s).toInt()) * 1000;
+    const auto delay = expiry - QDateTime::currentMSecsSinceEpoch();
+    if (type == u"userStatusOnline" && delay > 0 && delay <= std::numeric_limits<int>::max())
+        presence = Presence::Online;
+    else if (type == u"userStatusOffline" && status.value(u"was_online"_s).toInt() > 0)
+        presence = Presence::Offline;
+
+    for (const auto id : std::as_const(openedChats_)) {
+        const auto chat = chats_.constFind(id);
+        if (chat == chats_.cend() || chat->kind != ConversationKind::Direct || chat->peer != userId)
+            continue;
+        const ConversationId conversation { account_.id,
+            QString::number(owner_) + u'/' + QString::number(id) };
+        if (presence != Presence::Online) {
+            onlinePeerExpiries_.remove(id);
+        } else if (onlinePeerExpiries_.value(id) != expiry) {
+            onlinePeerExpiries_.insert(id, expiry);
+            QTimer::singleShot(
+                static_cast<int>(delay), Qt::PreciseTimer, this, [this, id, expiry, conversation] {
+                    if (onlinePeerExpiries_.value(id) == expiry) {
+                        onlinePeerExpiries_.remove(id);
+                        emit presenceChanged(conversation, Presence::Unknown);
+                    }
+                });
+        }
+        emit presenceChanged(conversation, presence);
+    }
+}
+
+void TelegramProvider::clearPeerPresence(qint64 id)
+{
+    onlinePeerExpiries_.remove(id);
+    const auto chat = chats_.constFind(id);
+    if (owner_ && chat != chats_.cend() && chat->kind == ConversationKind::Direct && chat->peer > 0
+        && chat->peer != owner_)
+        emit presenceChanged(
+            { account_.id, QString::number(owner_) + u'/' + QString::number(id) }, Presence::Unknown);
 }
 
 void TelegramProvider::loadMoreChats(bool archived)
@@ -635,22 +1064,38 @@ void TelegramProvider::acceptChat(const QJsonObject &object)
     const auto title = object.value(u"title"_s).toString();
     const auto conversationKind
         = type == u"chatTypePrivate" ? ConversationKind::Direct : ConversationKind::Group;
-    const bool canSend
-        = object.value(u"permissions"_s).toObject().value(u"can_send_basic_messages"_s).toBool(true);
+    const bool supergroup = type == u"chatTypeSupergroup";
+    const auto peerField = conversationKind == ConversationKind::Direct ? u"user_id"_s
+        : supergroup                                                    ? u"supergroup_id"_s
+                                                                        : u"basic_group_id"_s;
+    const auto peer = telegramId(kind.value(peerField));
+    const auto permissions = object.value(u"permissions"_s).toObject();
+    const bool canSend = permissions.value(u"can_send_basic_messages"_s).toBool(true);
     const bool protectedContent = object.value(u"has_protected_content"_s).toBool();
     const bool autoDeletes = object.value(u"message_auto_delete_time"_s).toInt() > 0;
+    const auto avatarFile = smallAvatarId(object.value(u"photo"_s).toObject());
+    const auto readOutbox = telegramId(object.value(u"last_read_outbox_message_id"_s));
+    updateReadOutbox(id, readOutbox);
     const auto known = chats_.constFind(id);
     if (known != chats_.cend() && known->title == title && known->kind == conversationKind
         && known->canSend == canSend && known->protectedContent == protectedContent
-        && known->autoDeletes == autoDeletes)
+        && known->autoDeletes == autoDeletes && known->avatarFile == avatarFile && known->peer == peer
+        && known->supergroup == supergroup && known->permissions == permissions)
         return;
     auto &chat = chats_[id];
     chat.title = title;
     chat.kind = conversationKind;
+    chat.peer = peer;
+    chat.supergroup = supergroup;
+    chat.permissions = permissions;
+    updateReadOutbox(id, readOutbox);
     chat.canSend = canSend;
     chat.protectedContent = protectedContent;
     chat.autoDeletes = autoDeletes;
+    setAvatar(id, chat, avatarFile);
     announce(id, chat);
+    loadAvatars();
+    refreshChatHistoryAccess(id);
 }
 
 void TelegramProvider::announce(qint64 chatId, const Chat &chat)
@@ -663,7 +1108,121 @@ void TelegramProvider::announce(qint64 chatId, const Chat &chat)
     conversation.kind = chat.kind;
     conversation.joined
         = state_ == ConnectionState::Connected && chat.canSend && !chat.protectedContent && !chat.autoDeletes;
+    if (const auto avatar = avatars_.constFind(chat.avatarFile); avatar != avatars_.cend())
+        conversation.avatar = avatar->data;
     emit conversationChanged(conversation);
+}
+
+void TelegramProvider::setAvatar(qint64 chatId, Chat &chat, int fileId)
+{
+    if (chat.avatarFile == fileId)
+        return;
+    if (auto previous = avatars_.find(chat.avatarFile); previous != avatars_.end()) {
+        previous->chats.remove(chatId);
+        if (previous->chats.isEmpty() && !previous->pending) {
+            avatarQueue_.removeAll(chat.avatarFile);
+            avatars_.erase(previous);
+        }
+    }
+    chat.avatarFile = fileId;
+    if (fileId <= 0)
+        return;
+    if (!avatars_.contains(fileId))
+        avatarQueue_.enqueue(fileId);
+    avatars_[fileId].chats.insert(chatId);
+}
+
+void TelegramProvider::loadAvatars()
+{
+    if (!owner_ || state_ != ConnectionState::Connected)
+        return;
+    while (pendingAvatars_ < MaxAvatarDownloads && !avatarQueue_.isEmpty()) {
+        const int fileId = avatarQueue_.dequeue();
+        avatars_[fileId].pending = true;
+        ++pendingAvatars_;
+        // The TDLib result waits for the download, while td_send remains asynchronous.
+        request({ { u"@type"_s, u"downloadFile"_s }, { u"file_id"_s, fileId }, { u"priority"_s, 1 },
+                    { u"offset"_s, 0 }, { u"limit"_s, MaxAvatarBytes + 1 }, { u"synchronous"_s, true } },
+            u"avatar"_s, fileId);
+    }
+}
+
+void TelegramProvider::finishAvatar(int fileId, const QJsonObject &file)
+{
+    auto avatar = avatars_.find(fileId);
+    if (avatar == avatars_.end() || !avatar->pending)
+        return;
+    avatar->pending = false;
+    --pendingAvatars_;
+    if (avatar->chats.isEmpty()) {
+        avatars_.erase(avatar);
+    } else if (file.value(u"id"_s).toInt() == fileId) {
+        avatar->data = readAvatar(file, profile_);
+        if (!avatar->data.isEmpty()) {
+            const auto chats = avatar->chats;
+            for (const auto id : chats) {
+                const auto chat = chats_.constFind(id);
+                if (chat != chats_.cend() && chat->avatarFile == fileId)
+                    announce(id, *chat);
+            }
+        }
+    }
+    loadAvatars();
+}
+
+void TelegramProvider::finishProfile(qint64 id, const QJsonObject &event)
+{
+    if (!pendingProfiles_.contains(id))
+        return;
+    auto details = pendingProfiles_.take(id);
+    const auto type = typeOf(event);
+    if (type == u"userFullInfo") {
+        const auto bio = event.value(u"bio"_s).toObject().value(u"text"_s).toString().trimmed().left(1024);
+        if (!bio.isEmpty())
+            details.append({ tr("Bio"), bio });
+    } else if (type == u"basicGroupFullInfo" || type == u"supergroupFullInfo") {
+        const auto description = event.value(u"description"_s).toString().trimmed().left(1024);
+        if (!description.isEmpty())
+            details.append({ tr("Description"), description });
+        const auto count = type == u"supergroupFullInfo" ? event.value(u"member_count"_s).toInt()
+                                                         : event.value(u"members"_s).toArray().size();
+        if (count > 0)
+            details.append({ tr("Members"), QString::number(count) });
+    }
+    emit profileReceived({ account_.id, QString::number(owner_) + u'/' + QString::number(id) }, details);
+}
+
+void TelegramProvider::acceptSendResult(const QJsonObject &event, bool failed)
+{
+    auto message = event.value(u"message"_s).toObject();
+    const auto remote = telegramId(message.value(u"chat_id"_s));
+    const auto oldId = telegramId(event.value(u"old_message_id"_s));
+    const auto newId = telegramId(message.value(u"id"_s));
+    if (owner_ && remote && chats_.contains(remote) && oldId > 0) {
+        settledTemporaryMessages_.insert(QString::number(remote) + u'/' + QString::number(oldId));
+        if (oldId != newId)
+            emit messageRemoved({ account_.id, QString::number(owner_) + u'/' + QString::number(remote) },
+                QString::number(oldId));
+    }
+    if (failed)
+        message.insert(u"sending_state"_s, QJsonObject { { u"@type"_s, u"messageSendingStateFailed"_s } });
+    else
+        message.remove(u"sending_state"_s);
+    acceptMessage(message, false);
+    if (failed)
+        emit notice(tr("Telegram could not send the message (error %1).")
+                .arg(errorCode(event.value(u"error"_s).toObject())));
+}
+
+void TelegramProvider::updateReadOutbox(qint64 id, qint64 sequence)
+{
+    auto chat = chats_.find(id);
+    if (chat == chats_.end() || chat->kind != ConversationKind::Direct || sequence <= chat->readOutbox)
+        return;
+    chat->readOutbox = sequence;
+    if (owner_)
+        emit messagesReadThrough(
+            { account_.id, QString::number(owner_) + u'/' + QString::number(id) }, sequence);
 }
 
 void TelegramProvider::acceptMessage(const QJsonObject &message, bool historical)
@@ -671,22 +1230,23 @@ void TelegramProvider::acceptMessage(const QJsonObject &message, bool historical
     const auto id = telegramId(message.value(u"id"_s));
     const auto remote = telegramId(message.value(u"chat_id"_s));
     auto chat = chats_.find(remote);
+    const bool outgoing = message.value(u"is_outgoing"_s).toBool();
+    const auto sending = typeOf(message.value(u"sending_state"_s).toObject());
     if (!owner_ || id <= 0 || chat == chats_.end() || chat->protectedContent || chat->autoDeletes
-        || message.value(u"sending_state"_s).isObject() || message.value(u"self_destruct_type"_s).isObject()
+        || message.value(u"self_destruct_type"_s).isObject()
+        || message.value(u"scheduling_state"_s).isObject()
         || message.value(u"auto_delete_in"_s).toDouble() > 0
         || message.value(u"self_destruct_in"_s).toDouble() > 0
-        || !message.value(u"can_be_saved"_s).toBool(true))
+        || !message.value(u"can_be_saved"_s).toBool(true) || (!sending.isEmpty() && !outgoing)
+        || (sending == u"messageSendingStatePending"
+            && settledTemporaryMessages_.contains(QString::number(remote) + u'/' + QString::number(id))))
         return;
-    const auto content = message.value(u"content"_s).toObject();
-    if (typeOf(content) != u"messageText")
-        return;
-    const auto text = content.value(u"text"_s).toObject().value(u"text"_s).toString();
+    const auto text = displayContent(message.value(u"content"_s).toObject());
     if (text.isEmpty())
         return;
 
     const auto sender = message.value(u"sender_id"_s).toObject();
     const auto userId = telegramId(sender.value(u"user_id"_s));
-    const bool outgoing = message.value(u"is_outgoing"_s).toBool();
     QString senderName = users_.value(userId);
     if (senderName.isEmpty()) {
         if (outgoing)
@@ -696,17 +1256,29 @@ void TelegramProvider::acceptMessage(const QJsonObject &message, bool historical
         else
             senderName = tr("Telegram participant");
     }
-    chat->latest = qMax(chat->latest, id);
+    if (sending.isEmpty())
+        chat->latest = qMax(chat->latest, id);
 
     Message value;
     value.conversation = { account_.id, QString::number(owner_) + u'/' + QString::number(remote) };
     value.id = QString::number(id);
+    value.sequence = id;
     value.sender = senderName;
     value.text = text;
     value.timestamp = QDateTime::fromSecsSinceEpoch(message.value(u"date"_s).toInteger(), QTimeZone::UTC);
     value.outgoing = outgoing;
     value.mention = message.value(u"contains_unread_mention"_s).toBool();
     value.historical = historical;
+    if (outgoing) {
+        if (sending == u"messageSendingStatePending")
+            value.delivery = DeliveryState::Pending;
+        else if (sending == u"messageSendingStateFailed")
+            value.delivery = DeliveryState::Failed;
+        else if (sending.isEmpty())
+            value.delivery = chat->kind == ConversationKind::Direct && chat->readOutbox >= id
+                ? DeliveryState::Read
+                : DeliveryState::Sent;
+    }
     emit messageReceived(value);
 }
 
@@ -722,17 +1294,29 @@ qint64 TelegramProvider::chatId(const ConversationId &id) const
 
 void TelegramProvider::fetchHistory(qint64 id)
 {
+    auto history = histories_.find(id);
+    if (history == histories_.end() || !history->active || history->pending
+        || state_ != ConnectionState::Connected)
+        return;
     const auto chat = chats_.constFind(id);
-    if (chat == chats_.cend() || chat->protectedContent || chat->autoDeletes) {
-        historyPending_.remove(id);
-        if (chat != chats_.cend())
-            emit notice(tr("This Telegram chat uses protected or auto-deleting messages. Open it in an "
-                           "official Telegram client; PhosChat does not yet support these messages."));
+    if (chat == chats_.cend()) {
+        if (!chatPending_.contains(id)) {
+            chatPending_.insert(id);
+            request({ { u"@type"_s, u"getChat"_s }, { u"chat_id"_s, id } }, u"chat"_s, id);
+        }
         return;
     }
-    request({ { u"@type"_s, u"getChatHistory"_s }, { u"chat_id"_s, id }, { u"from_message_id"_s, 0 },
-                { u"offset"_s, 0 }, { u"limit"_s, HistoryLimit }, { u"only_local"_s, false } },
-        u"history"_s, id);
+    if (chat->protectedContent || chat->autoDeletes) {
+        histories_.remove(id);
+        notifyHistory(id);
+        return;
+    }
+    history->pending = true;
+    history->requestToken = ++historyToken_;
+    request({ { u"@type"_s, u"getChatHistory"_s }, { u"chat_id"_s, id },
+                { u"from_message_id"_s, history->cursor }, { u"offset"_s, 0 },
+                { u"limit"_s, history->remaining + (history->cursor ? 1 : 0) }, { u"only_local"_s, false } },
+        u"history"_s, id, history->requestToken);
 }
 
 void TelegramProvider::sendRead(qint64 id)

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QListView>
+#include <QPersistentModelIndex>
 
 namespace phoschat::ui {
 
@@ -17,7 +18,12 @@ protected:
 
 private:
     void copyCurrentMessage();
+    void scheduleScrollAdjustment();
+    QPersistentModelIndex m_scrollAnchor;
+    int m_anchorTop {};
     bool m_wasAtBottom { true };
+    bool m_adjustmentPending {};
+    bool m_followLatest {};
 };
 
 } // namespace phoschat::ui

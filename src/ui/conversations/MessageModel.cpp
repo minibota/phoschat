@@ -1,5 +1,7 @@
 #include "ui/conversations/MessageModel.hpp"
 
+#include <QCoreApplication>
+
 #include <algorithm>
 #include <utility>
 
@@ -8,6 +10,23 @@ namespace {
 
     constexpr int kTimelineLimit = 1000;
     constexpr int kTrimBatch = 100;
+
+    QString deliveryLabel(DeliveryState state)
+    {
+        switch (state) {
+        case DeliveryState::Pending:
+            return QCoreApplication::translate("MessageModel", "Sending…");
+        case DeliveryState::Sent:
+            return QCoreApplication::translate("MessageModel", "Sent");
+        case DeliveryState::Read:
+            return QCoreApplication::translate("MessageModel", "Read");
+        case DeliveryState::Failed:
+            return QCoreApplication::translate("MessageModel", "Not sent");
+        case DeliveryState::None:
+            return {};
+        }
+        return {};
+    }
 
 } // namespace
 
@@ -41,8 +60,13 @@ QVariant MessageModel::data(const QModelIndex &index, int role) const
     switch (role) {
     case Qt::DisplayRole:
         return message.text;
-    case Qt::AccessibleTextRole:
-        return tr("%1 wrote %2").arg(message.sender, message.text);
+    case Qt::AccessibleTextRole: {
+        auto text = tr("%1 wrote %2").arg(message.sender, message.text);
+        const auto status = deliveryLabel(message.delivery);
+        if (!status.isEmpty())
+            text += QStringLiteral(". ") + status;
+        return text;
+    }
     case SenderRole:
         return message.sender;
     case TimeRole:
@@ -51,6 +75,12 @@ QVariant MessageModel::data(const QModelIndex &index, int role) const
         return message.outgoing;
     case MentionRole:
         return message.mention;
+    case HistoricalRole:
+        return message.historical;
+    case MessageIdRole:
+        return message.id;
+    case DeliveryRole:
+        return deliveryLabel(message.delivery);
     default:
         return {};
     }
@@ -66,7 +96,7 @@ void MessageModel::append(const Message &message)
         return;
     }
 
-    if (m_messages.size() >= kTimelineLimit) {
+    if (!m_retainFullHistory && m_messages.size() >= kTimelineLimit) {
         beginRemoveRows({}, 0, kTrimBatch - 1);
         m_messages.remove(0, kTrimBatch);
         m_rowsById.clear();
@@ -74,8 +104,7 @@ void MessageModel::append(const Message &message)
         endRemoveRows();
     }
 
-    const auto position = std::upper_bound(m_messages.cbegin(), m_messages.cend(), message.timestamp,
-        [](const QDateTime &time, const Message &entry) { return time < entry.timestamp; });
+    const auto position = std::upper_bound(m_messages.cbegin(), m_messages.cend(), message, messageBefore);
     const auto row = static_cast<int>(position - m_messages.cbegin());
     beginInsertRows({}, row, row);
     m_messages.insert(row, message);

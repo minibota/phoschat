@@ -1,10 +1,12 @@
 cmake_minimum_required(VERSION 3.22)
-project(PhosChat VERSION 0.2.1 LANGUAGES CXX)
+project(PhosChat VERSION 0.2.2 LANGUAGES CXX)
 
 include(CTest)
 include(GNUInstallDirs)
 include(cmake/TelegramCredentials.cmake)
 phoschat_configure_telegram_credentials("${PROJECT_BINARY_DIR}/generated")
+include(cmake/SlackApplication.cmake)
+phoschat_configure_slack_application("${PROJECT_BINARY_DIR}/generated")
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -40,6 +42,7 @@ add_library(phoschat_core STATIC
     src/providers/irc/irc_message.cpp
     src/providers/irc/irc_provider.cpp
     src/providers/slack/slack_oauth.cpp
+    src/providers/slack/slack_app_config.cpp
     src/providers/slack/slack_provider.cpp
     src/providers/telegram/telegram_provider.cpp
     src/providers/telegram/telegram_transport.cpp
@@ -62,6 +65,7 @@ phoschat_warnings(phoschat_core)
 add_library(phoschat_ui STATIC
     src/ui/contacts/MainWindow.cpp
     src/ui/conversations/ConversationController.cpp
+    src/ui/conversations/ConversationProfile.cpp
     src/ui/conversations/MessageModel.cpp
     src/ui/conversations/MessageView.cpp
     src/ui/discovery/IrcDirectoryDialog.cpp
@@ -80,6 +84,11 @@ add_executable(phoschat WIN32 MACOSX_BUNDLE
 )
 target_compile_definitions(phoschat PRIVATE PHOSCHAT_VERSION="${PROJECT_VERSION}")
 target_link_libraries(phoschat PRIVATE phoschat_ui)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    find_package(Qt6 6.8 REQUIRED COMPONENTS DBus)
+    target_sources(phoschat PRIVATE src/notifications/linux_notifier.cpp)
+    target_link_libraries(phoschat PRIVATE Qt6::DBus)
+endif()
 set_target_properties(phoschat PROPERTIES
     MACOSX_BUNDLE_BUNDLE_NAME PhosChat
     MACOSX_BUNDLE_GUI_IDENTIFIER io.phoschat.desktop
@@ -98,13 +107,36 @@ if(BUILD_TESTING)
         add_test(NAME phoschat.${suite} COMMAND test_${suite})
         set_tests_properties(phoschat.${suite} PROPERTIES TIMEOUT 40)
     endforeach()
-    foreach(suite IN ITEMS ui account_overview irc_accounts)
+    foreach(suite IN ITEMS ui account_overview irc_accounts history_ui slack_onboarding)
         add_executable(test_${suite} tests/test_${suite}.cpp)
         target_link_libraries(test_${suite} PRIVATE phoschat_ui Qt6::Test)
         phoschat_warnings(test_${suite})
         add_test(NAME phoschat.${suite} COMMAND test_${suite})
         set_tests_properties(phoschat.${suite} PROPERTIES TIMEOUT 40 ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
     endforeach()
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_executable(test_notifications tests/test_notifications.cpp
+            src/notifications/linux_notifier.cpp src/notifications/notification_manager.cpp)
+        target_link_libraries(test_notifications PRIVATE phoschat_ui Qt6::Test Qt6::DBus)
+        phoschat_warnings(test_notifications)
+        find_program(PHOSCHAT_DBUS_RUN_SESSION dbus-run-session)
+        set(PHOSCHAT_NOTIFICATION_TEST_BUS_CONFIG "" CACHE FILEPATH
+            "Optional private D-Bus configuration for notification tests in restricted environments")
+        if(PHOSCHAT_DBUS_RUN_SESSION)
+            set(phoschat_notification_test_bus_args)
+            if(PHOSCHAT_NOTIFICATION_TEST_BUS_CONFIG)
+                list(APPEND phoschat_notification_test_bus_args
+                    "--config-file=${PHOSCHAT_NOTIFICATION_TEST_BUS_CONFIG}")
+            endif()
+            add_test(NAME phoschat.notifications
+                COMMAND "${PHOSCHAT_DBUS_RUN_SESSION}" ${phoschat_notification_test_bus_args}
+                    -- "$<TARGET_FILE:test_notifications>")
+            set_tests_properties(phoschat.notifications PROPERTIES TIMEOUT 40
+                ENVIRONMENT "QT_QPA_PLATFORM=offscreen;PHOSCHAT_PRIVATE_NOTIFICATION_TEST_BUS=1")
+        else()
+            message(STATUS "dbus-run-session unavailable; isolated notification integration test is disabled.")
+        endif()
+    endif()
 endif()
 
 include(cmake/PhosChatPackaging.cmake)
