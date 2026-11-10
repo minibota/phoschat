@@ -31,11 +31,23 @@ public:
 
     QString registrationDiagnostic(const QSignalSpy &errors) const
     {
-        const auto error = errors.isEmpty() ? acceptError_ : errors.constLast().constFirst().toString();
-        return QStringLiteral("Received %1 registration commands, accepted peer %2, error: %3")
+        const auto clientError
+            = errors.isEmpty() ? QStringLiteral("none reported") : errors.constLast().constFirst().toString();
+        const auto backend
+            = configuration_.isNull() ? QStringLiteral("plain TCP") : QSslSocket::activeBackend();
+        return QStringLiteral("Received %1 registration commands, accepted peer %2, backend %3, "
+                              "peer encrypted %4, client error: %5, peer error: %6")
             .arg(commands.size())
             .arg(peer_ ? QStringLiteral("yes") : QStringLiteral("no"))
-            .arg(error.isEmpty() ? QStringLiteral("none reported") : error);
+            .arg(backend)
+            .arg(peerEncrypted_ ? QStringLiteral("yes") : QStringLiteral("no"))
+            .arg(clientError)
+            .arg(peerError_.isEmpty() ? QStringLiteral("none reported") : peerError_);
+    }
+
+    bool registrationFinishedOrFailed(const QSignalSpy &errors) const
+    {
+        return commands.size() == 3 || !errors.isEmpty() || !peerError_.isEmpty();
     }
 
     QList<QByteArray> commands;
@@ -46,11 +58,16 @@ protected:
         auto *tlsPeer = configuration_.isNull() ? nullptr : new QSslSocket(this);
         auto *peer = tlsPeer ? static_cast<QTcpSocket *>(tlsPeer) : new QTcpSocket(this);
         if (!peer->setSocketDescriptor(descriptor)) {
-            acceptError_ = peer->errorString();
+            peerError_ = peer->errorString();
             peer->deleteLater();
             return;
         }
         peer_ = peer;
+        connect(peer, &QAbstractSocket::errorOccurred, this, [this, peer] {
+            if (peerError_.isEmpty()) {
+                peerError_ = peer->errorString();
+            }
+        });
         connect(peer, &QIODevice::readyRead, this, [this, peer] {
             while (peer->canReadLine()) {
                 auto line = peer->readLine();
@@ -61,6 +78,12 @@ protected:
             }
         });
         if (tlsPeer) {
+            connect(tlsPeer, &QSslSocket::encrypted, this, [this] { peerEncrypted_ = true; });
+            connect(tlsPeer, &QSslSocket::sslErrors, this, [this](const QList<QSslError> &errors) {
+                if (!errors.isEmpty()) {
+                    peerError_ = errors.constFirst().errorString();
+                }
+            });
             tlsPeer->setSslConfiguration(configuration_);
             tlsPeer->startServerEncryption();
         }
@@ -69,7 +92,8 @@ protected:
 private:
     QSslConfiguration configuration_;
     QTcpSocket *peer_ = nullptr;
-    QString acceptError_;
+    QString peerError_;
+    bool peerEncrypted_ = false;
 };
 
 QByteArray readFixture(const QString &path)
@@ -115,7 +139,14 @@ private slots:
     void reportsUnavailableSasl();
 };
 
-void IrcTest::initTestCase() { QNetworkProxy::setApplicationProxy(QNetworkProxy(QNetworkProxy::NoProxy)); }
+void IrcTest::initTestCase()
+{
+#ifdef Q_OS_MACOS
+    // Secure Transport imports the fixture key. Keep it out of the user's keychain.
+    QVERIFY(qputenv("QT_SSL_USE_TEMPORARY_KEYCHAIN", "1"));
+#endif
+    QNetworkProxy::setApplicationProxy(QNetworkProxy(QNetworkProxy::NoProxy));
+}
 
 void IrcTest::parsesAndBoundsFrames()
 {
@@ -329,7 +360,10 @@ void IrcTest::negotiatesTlsSaslAndExchangesMessages()
 
     const QByteArray secret(294, 'x'); // 300-byte PLAIN payload becomes exactly one 400-byte chunk.
     provider.connectAccount(secret);
-    QTRY_COMPARE_WITH_TIMEOUT(server.commands.size(), 3, 5000);
+    QTRY_VERIFY2_WITH_TIMEOUT(
+        server.registrationFinishedOrFailed(errors), qPrintable(server.registrationDiagnostic(errors)), 5000);
+    QVERIFY2(
+        server.commands.size() == 3 && errors.isEmpty(), qPrintable(server.registrationDiagnostic(errors)));
     QCOMPARE(server.commands.at(0), QByteArray("CAP LS 302"));
     QCOMPARE(server.commands.at(2), QByteArray("USER phoschat 0 * :PhosChat"));
     server.send(":irc CAP * LS * :message-tags sasl=PLAIN,EXTERNAL\r\n");
@@ -490,7 +524,10 @@ void IrcTest::reportsUnavailableSasl()
     IrcProvider provider(account, trustedTls);
     QSignalSpy errors(&provider, &IChatProvider::errorOccurred);
     provider.connectAccount("test-only");
-    QTRY_COMPARE_WITH_TIMEOUT(server.commands.size(), 3, 5000);
+    QTRY_VERIFY2_WITH_TIMEOUT(
+        server.registrationFinishedOrFailed(errors), qPrintable(server.registrationDiagnostic(errors)), 5000);
+    QVERIFY2(
+        server.commands.size() == 3 && errors.isEmpty(), qPrintable(server.registrationDiagnostic(errors)));
     server.send(":irc CAP * LS :sasl=EXTERNAL\r\n");
     QTRY_COMPARE(errors.size(), 1);
     QCOMPARE(errors.constFirst().at(1).toBool(), false);
