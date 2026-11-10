@@ -76,7 +76,8 @@ void SlackOnboardingTest::newAccountUsesConfiguredSignIn()
     auto *token = dialog.findChild<QLineEdit *>(u"providerCredential"_s);
     auto *connectButton = dialog.findChild<QPushButton *>(u"connectAccount"_s);
     auto *save = dialog.findChild<QPushButton *>(u"saveAccount"_s);
-    QVERIFY(protocol && advanced && application && token && connectButton && save);
+    auto *remember = dialog.findChild<QCheckBox *>(u"rememberSession"_s);
+    QVERIFY(protocol && advanced && application && token && connectButton && save && remember);
     protocol->setCurrentIndex(protocol->findData(static_cast<int>(Protocol::Slack)));
     dialog.show();
     QVERIFY(QTest::qWaitForWindowExposed(&dialog));
@@ -94,6 +95,8 @@ void SlackOnboardingTest::newAccountUsesConfiguredSignIn()
                                                   : u"/slack-unconfigured.png"_s)));
     }
     if (bundledSlackApplicationAvailable()) {
+        // Keep this UI test independent of the operating system credential store.
+        remember->setChecked(false);
         // Hidden values from another provider must not override the public app identity.
         application->setText(u"999.999"_s);
         token->setText(u"must-not-be-saved"_s);
