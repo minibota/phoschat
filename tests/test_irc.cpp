@@ -82,7 +82,7 @@ Account loopbackAccount(quint16 port, bool tls = true)
 {
     Account account;
     account.id = QStringLiteral("test-network");
-    account.host = tls ? QStringLiteral("localhost") : QStringLiteral("127.0.0.1");
+    account.host = QStringLiteral("127.0.0.1");
     account.port = port;
     account.nick = QStringLiteral("Tester");
     account.tls = tls;
@@ -433,9 +433,10 @@ void IrcTest::rejectsInvalidCertificates()
 {
     QFETCH(bool, trustFixture);
     QVERIFY(QSslSocket::supportsSsl());
+    const auto certificatePath = trustFixture ? QFINDTESTDATA("fixtures/irc-test-wrong-host.pem")
+                                              : QFINDTESTDATA("fixtures/irc-test-server.pem");
     auto serverTls = QSslConfiguration::defaultConfiguration();
-    serverTls.setLocalCertificate(
-        QSslCertificate(readFixture(QFINDTESTDATA("fixtures/irc-test-server.pem"))));
+    serverTls.setLocalCertificate(QSslCertificate(readFixture(certificatePath)));
     serverTls.setPrivateKey(
         QSslKey(readFixture(QFINDTESTDATA("fixtures/irc-test-server-key.pem")), QSsl::Rsa));
     serverTls.setPeerVerifyMode(QSslSocket::VerifyNone);
@@ -444,13 +445,12 @@ void IrcTest::rejectsInvalidCertificates()
 
     IrcLoopbackServer server(serverTls);
     QVERIFY(server.listen(QHostAddress::LocalHost));
-    auto account = loopbackAccount(server.serverPort());
+    const auto account = loopbackAccount(server.serverPort());
     auto clientTls = QSslConfiguration::defaultConfiguration();
     if (trustFixture) {
         const auto ca = QSslCertificate(readFixture(QFINDTESTDATA("fixtures/irc-test-ca.pem")));
         QVERIFY(!ca.isNull());
         clientTls.setCaCertificates({ ca });
-        account.host = QStringLiteral("127.0.0.1");
     }
     IrcProvider provider(account, clientTls);
     QSignalSpy errors(&provider, &IChatProvider::errorOccurred);
