@@ -198,8 +198,10 @@ void AccountOverviewTest::searchAndRefreshKeepTheOpenAccount()
         conversations.setFavorite({ u"0"_s, u"0"_s }, true);
         QTRY_VERIFY(header(main, u"favorites"_s));
         QVERIFY(header(main, u"account/0"_s)->isChecked());
-        QVERIFY(header(main, u"account/1"_s)->isVisible());
-        QVERIFY(header(main, u"account/2"_s)->isVisible());
+        // QLayout queues the show of newly inserted child widgets. A header can
+        // exist before that event runs after the asynchronous section rebuild.
+        QTRY_VERIFY(header(main, u"account/1"_s)->isVisible());
+        QTRY_VERIFY(header(main, u"account/2"_s)->isVisible());
     }
     MainWindow reopened(accounts, conversations, windows);
     reopened.show();
