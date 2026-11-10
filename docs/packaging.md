@@ -19,7 +19,7 @@ runtime from Flathub and keeps its local profile inside the application sandbox.
 ## Native package builds
 
 Configure and compile with the normal Qt development dependencies and the
-CPack generator for the target system. Debian needs `dpkg-dev`. Fedora
+CPack generator for the target system. Debian needs `dpkg-dev` and `file`. Fedora
 needs `rpm-build`. Windows needs NSIS 3.03+ and the Qt desktop SDK.
 
 ```sh
@@ -54,10 +54,17 @@ flatpak build-bundle --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakr
 
 Change `packaging/release-version` and the CMake project version together.
 Pushing that change to `main` builds all four packages, runs installation smoke
-tests, and publishes a tagged prerelease with checksums. A matching tag push also
+tests, and then attempts to publish a tagged prerelease with checksums. A matching tag push also
 triggers the release. For a package-only preview, run **Package and release**
 manually with **Publish** disabled. A manual release from `main` uses the same
 checks and version gate.
+
+If GitHub denies release creation to the Actions integration, a repository
+maintainer can reuse the four successful installer artifacts. Download them from
+that same run, put the installers in one directory, and generate `SHA256SUMS`
+with `sha256sum`. Use an authenticated GitHub CLI session to publish the
+prerelease and attach the four packages and `SHA256SUMS`. Target the exact
+commit shown on the packaging run so the tag and the built source match.
 
 The matching GitHub tag contains the corresponding source. Packages include
 the project license and applicable dependency notices. See
